@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 from pathlib import Path
 from typing import List, Optional
 
@@ -89,6 +90,75 @@ class FolderScanWorker(QThread):
             self.file_found.emit(info)
 
         self.scan_finished.emit(results)
+
+class TriggerEditorDialog(QDialog):
+    """Protected modal dialog for configuring trigger words away from main view."""
+    def __init__(self, current_words: List[str], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Configure Trigger Words (Sensitive Panel)")
+        self.resize(520, 380)
+        self.words = list(current_words)
+        self.setup_ui()
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        notice_box = QFrame()
+        notice_box.setStyleSheet("background-color: #fcf8e3; border: 1px solid #faebcc; border-radius: 4px; padding: 8px;")
+        nb_layout = QVBoxLayout(notice_box)
+        nb_layout.setContentsMargins(8, 6, 8, 6)
+        notice_lbl = QLabel(
+            "<b>Sensitive Content Warning</b><br>"
+            "This panel displays and allows editing the trigger words that SubDuck will duck in audio and censor in subtitles. "
+            "Words are hidden on the main application screen to keep your viewing experience safe."
+        )
+        notice_lbl.setWordWrap(True)
+        notice_lbl.setStyleSheet("color: #8a6d3b; font-size: 12px;")
+        nb_layout.addWidget(notice_lbl)
+        layout.addWidget(notice_box)
+
+        self.chk_reveal = QCheckBox("Reveal sensitive words on screen")
+        self.chk_reveal.setChecked(True)
+        self.chk_reveal.toggled.connect(self.on_toggle_reveal)
+        layout.addWidget(self.chk_reveal)
+
+        self.lbl_input = QLabel("Trigger Words (comma or newline separated):")
+        layout.addWidget(self.lbl_input)
+
+        self.edit_words = QTextEdit()
+        self.edit_words.setPlaceholderText("Enter sensitive words, e.g. cancer, tumor, chemo...")
+        self.edit_words.setPlainText(", ".join(self.words))
+        layout.addWidget(self.edit_words)
+
+        self.lbl_masked = QLabel("<i>[Words hidden. Check 'Reveal sensitive words on screen' above to view and edit.]</i>")
+        self.lbl_masked.setStyleSheet("color: #7f8c8d; padding: 40px; font-size: 13px;")
+        self.lbl_masked.setAlignment(Qt.AlignCenter)
+        self.lbl_masked.setVisible(False)
+        layout.addWidget(self.lbl_masked)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def on_toggle_reveal(self, checked: bool):
+        self.edit_words.setVisible(checked)
+        self.lbl_masked.setVisible(not checked)
+
+    def on_accept(self):
+        raw = self.edit_words.toPlainText()
+        tokens = [w.strip().lower() for w in re.split(r"[,\n\r]+", raw) if w.strip()]
+        seen = set()
+        deduped = []
+        for w in tokens:
+            if w not in seen:
+                seen.add(w)
+                deduped.append(w)
+        self.words = deduped
+        self.accept()
+
+    def get_words(self) -> List[str]:
+        return self.words
 
 class SettingsDialog(QDialog):
     def __init__(self, config: CensorConfig, source_dir: Optional[Path] = None, parent=None):
@@ -308,7 +378,8 @@ class MainWindow(QMainWindow):
         self.btn_browse = QPushButton("Browse...")
         self.btn_browse.clicked.connect(self.browse_folder)
 
-        self.btn_smb = QPushButton("SMB / Network...")
+        self.btn_smb = QPushButton("Enter Path")
+        self.btn_smb.setToolTip("Enter direct folder path, local path, or SMB network URL (e.g. smb://nas.local/media/...)")
         self.btn_smb.setStyleSheet("font-weight: 500;")
         self.btn_smb.clicked.connect(self.open_smb_dialog)
 
@@ -357,14 +428,17 @@ class MainWindow(QMainWindow):
         trig_layout.addLayout(trig_row1)
 
         trig_row2 = QHBoxLayout()
-        trig_row2.addWidget(QLabel("Trigger Words (comma or newline separated):"))
-        trig_layout.addLayout(trig_row2)
+        self.lbl_trigger_summary = QLabel("Active Triggers: 0 words configured (Protected from view)")
+        self.lbl_trigger_summary.setStyleSheet("font-weight: 500; color: #2c3e50;")
+        trig_row2.addWidget(self.lbl_trigger_summary, 1)
 
-        self.edit_triggers = QTextEdit()
-        self.edit_triggers.setMaximumHeight(55)
-        self.edit_triggers.setPlaceholderText("e.g. cancer, tumor, chemo, blood, gore")
-        self.edit_triggers.textChanged.connect(self.on_triggers_edited)
-        trig_layout.addWidget(self.edit_triggers)
+        self.btn_edit_triggers = QPushButton("Edit Trigger Words...")
+        self.btn_edit_triggers.setStyleSheet("font-weight: bold; padding: 4px 12px;")
+        self.btn_edit_triggers.setToolTip("Open protected panel to review or edit sensitive trigger words")
+        self.btn_edit_triggers.clicked.connect(self.open_trigger_editor)
+        trig_row2.addWidget(self.btn_edit_triggers)
+
+        trig_layout.addLayout(trig_row2)
 
         root_layout.addWidget(trig_group)
 
@@ -397,9 +471,17 @@ class MainWindow(QMainWindow):
         insp_layout = QVBoxLayout(insp_container)
         insp_layout.setContentsMargins(0, 0, 0, 0)
 
+        insp_header = QHBoxLayout()
         self.lbl_insp_title = QLabel("Trigger Moments Inspector")
         self.lbl_insp_title.setStyleSheet("font-weight: bold; font-size: 13px;")
-        insp_layout.addWidget(self.lbl_insp_title)
+        insp_header.addWidget(self.lbl_insp_title, 1)
+
+        self.chk_reveal_inspector = QCheckBox("Reveal Uncensored")
+        self.chk_reveal_inspector.setToolTip("Toggle on to view raw uncensored trigger words and subtitle lines")
+        self.chk_reveal_inspector.setChecked(False)
+        self.chk_reveal_inspector.toggled.connect(self.on_table_row_selected)
+        insp_header.addWidget(self.chk_reveal_inspector)
+        insp_layout.addLayout(insp_header)
 
         self.insp_table = QTableWidget(0, 3)
         self.insp_table.setHorizontalHeaderLabels(["Timestamp", "Words", "Subtitle Line Preview"])
@@ -485,24 +567,54 @@ class MainWindow(QMainWindow):
             self.combo_profile.addItem(name)
         if "Medical & Illness Triggers" in self.profiles:
             self.combo_profile.setCurrentText("Medical & Illness Triggers")
+        else:
+            self.update_trigger_summary_label()
 
     def on_profile_changed(self):
         name = self.combo_profile.currentText()
         if name in self.profiles:
             p_data = self.profiles[name]
             words = p_data.get("trigger_words", [])
-            self.edit_triggers.setPlainText(", ".join(words))
-            self.config.trigger_words = words
+            self.config.trigger_words = list(words)
+            self.update_trigger_summary_label()
             self.config.safety_before_ms = p_data.get("safety_before_ms", 200)
             self.config.safety_after_ms = p_data.get("safety_after_ms", 200)
             self.config.ducking_level = p_data.get("ducking_level", 0.0)
             self.config.censor_style = p_data.get("censor_style", "asterisks")
             self.config.strict_matching = p_data.get("strict_matching", True)
 
-    def on_triggers_edited(self):
-        raw = self.edit_triggers.toPlainText()
-        tokens = [t.strip() for t in raw.replace("\n", ",").split(",") if t.strip()]
-        self.config.trigger_words = tokens
+    def update_trigger_summary_label(self):
+        count = len(self.config.trigger_words)
+        self.lbl_trigger_summary.setText(
+            f"Active Triggers: {count} word(s) configured (Protected from view)"
+        )
+
+    def open_trigger_editor(self):
+        dlg = TriggerEditorDialog(self.config.trigger_words, parent=self)
+        if dlg.exec():
+            self.config.trigger_words = dlg.get_words()
+            self.update_trigger_summary_label()
+            if self.video_items:
+                for item in self.video_items:
+                    if item.subtitle_entries:
+                        item.matches = scan_subtitles_for_triggers(item.subtitle_entries, self.config)
+                        item.trigger_count = len(item.matches)
+                self.refresh_table()
+
+    def refresh_table(self):
+        self.table.setRowCount(0)
+        for info in self.video_items:
+            self.on_file_found(info)
+        total = len(self.video_items)
+        with_subs = sum(1 for r in self.video_items if r.has_subtitles)
+        with_triggers = sum(1 for r in self.video_items if r.matches)
+        total_triggers = sum(r.trigger_count for r in self.video_items)
+        self.lbl_stats.setText(
+            f"Found {total} Video File(s)  |  {with_subs} with Subtitles  |  "
+            f"{with_triggers} with Trigger Words ({total_triggers} total instances detected)"
+        )
+        if self.table.rowCount() > 0:
+            self.table.selectRow(0)
 
     def save_current_profile(self):
         name, ok = QInputDialog.getText(self, "Save Preset Profile", "Profile Name:", text=self.combo_profile.currentText())
@@ -545,15 +657,14 @@ class MainWindow(QMainWindow):
             self.edit_folder.setText(folder)
 
     def open_smb_dialog(self):
-        default_url = self.edit_folder.text()
-        if not default_url.startswith("smb://"):
-            default_url = "smb://nas.local/media/Apocalypse (2026)/Season 1"
+        default_url = self.edit_folder.text().strip()
+        if not default_url:
+            default_url = "smb://nas.local/media/"
 
         url, ok = QInputDialog.getText(
             self,
-            "Connect to SMB / Network Share",
-            "Enter SMB Network URL (from Dolphin or Unraid):\n"
-            "e.g. smb://nas.local/media/...",
+            "Enter Path",
+            "Enter directory path or SMB URL (e.g. smb://nas.local/media/... or /path/...):",
             text=default_url
         )
         if ok and url.strip():
@@ -672,6 +783,7 @@ class MainWindow(QMainWindow):
             info = self.video_items[idx]
             self.lbl_insp_title.setText(f"Trigger Moments: {info.filename} ({len(info.matches)} detected)")
             self.insp_table.setRowCount(0)
+            reveal = getattr(self, "chk_reveal_inspector", None) and self.chk_reveal_inspector.isChecked()
 
             for m in info.matches:
                 i_row = self.insp_table.rowCount()
@@ -680,11 +792,19 @@ class MainWindow(QMainWindow):
                 ts_item = QTableWidgetItem(f"{m.entry.start_str} --> {m.entry.end_str}")
                 self.insp_table.setItem(i_row, 0, ts_item)
 
-                w_item = QTableWidgetItem(", ".join(m.matched_words))
-                w_item.setForeground(QColor("#e67e22"))
+                if reveal:
+                    w_item = QTableWidgetItem(", ".join(m.matched_words))
+                    w_item.setForeground(QColor("#e67e22"))
+                else:
+                    w_item = QTableWidgetItem("[Protected]")
+                    w_item.setForeground(QColor("#7f8c8d"))
                 self.insp_table.setItem(i_row, 1, w_item)
 
-                prev_item = QTableWidgetItem(f"{m.entry.text}\n-> {m.censored_text}")
+                if reveal:
+                    prev_text = f"{m.entry.text}\n-> {m.censored_text}"
+                else:
+                    prev_text = f"-> {m.censored_text}"
+                prev_item = QTableWidgetItem(prev_text)
                 self.insp_table.setItem(i_row, 2, prev_item)
 
     def select_all_flagged(self):
@@ -753,12 +873,17 @@ class MainWindow(QMainWindow):
 
         self.process_thread.start()
 
-    def on_process_file_started(self, filename: str):
-        self.lbl_status.setText(f"Processing: {filename}...")
+    def on_process_file_started(self, filename: str, current: int, total: int):
+        self.lbl_status.setText(f"Processing ({current}/{total}): {filename}...")
+        self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(current - 1)
+        pct = int(((current - 1) / total) * 100) if total > 0 else 0
+        self.progress_bar.setFormat(f"Processing {current} of {total} ({pct}%) - {filename}")
 
-    def on_process_file_finished(self, filename: str, success: bool, msg: str):
-        val = self.progress_bar.value() + 1
-        self.progress_bar.setValue(val)
+    def on_process_file_finished(self, filename: str, success: bool, msg: str, current: int, total: int):
+        self.progress_bar.setValue(current)
+        pct = int((current / total) * 100) if total > 0 else 100
+        self.progress_bar.setFormat(f"Completed {current} of {total} ({pct}%)")
         for row in range(self.table.rowCount()):
             item_f = self.table.item(row, 1)
             if item_f and item_f.text() == filename:

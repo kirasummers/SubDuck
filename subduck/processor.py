@@ -89,6 +89,17 @@ def get_container_subtitle_codec(ext: str) -> Optional[str]:
         return "webvtt"
     return None
 
+def safe_copy_file(src: Path, dst: Path):
+    """
+    Safely copy a file, working around FUSE/SMB limitations where
+    copystat (e.g. utime, xattrs) raises Errno 25 (Inappropriate ioctl for device).
+    """
+    shutil.copyfile(src, dst)
+    try:
+        shutil.copystat(src, dst)
+    except OSError:
+        pass
+
 def copy_artwork_and_metadata(source_dir: Path, target_dir: Path, log_fn=None):
     """Copy thumbnails, posters, and NFO metadata to target directory."""
     if not source_dir.is_dir() or not target_dir.is_dir():
@@ -98,7 +109,7 @@ def copy_artwork_and_metadata(source_dir: Path, target_dir: Path, log_fn=None):
             if item.is_file() and item.suffix.lower() in ARTWORK_EXTS:
                 dest = target_dir / item.name
                 if not dest.exists():
-                    shutil.copy2(item, dest)
+                    safe_copy_file(item, dest)
                     if log_fn:
                         log_fn(f"Copied artwork: {item.name}")
     except Exception as e:
@@ -124,17 +135,37 @@ def process_single_video(
         if not out_video_path.exists() or out_video_path.stat().st_size != info.file_size:
             log(f"Copying clean episode to mirror folder: {info.filename}")
             try:
-                shutil.copy2(info.path, out_video_path)
-                # Also copy external subtitle if present
-                for srt_candidate in [info.path.parent / f"{info.path.stem}.srt", info.path.parent / f"{info.path.stem}.en.srt"]:
-                    if srt_candidate.is_file():
-                        shutil.copy2(srt_candidate, out_video_path.parent / srt_candidate.name)
-                info.output_path = out_video_path
-                return True, "Clean episode copied to season mirror."
+                safe_copy_file(info.path, out_video_path)
             except Exception as e:
                 log(f"Error copying clean episode: {e}")
                 return False, str(e)
-        return True, "Clean episode already present in mirror folder."
+        else:
+            log(f"Clean episode already present in mirror folder: {info.filename}")
+
+        # Always ensure all associated subtitle files are copied to the mirror folder
+        try:
+            has_exact_srt = False
+            for s_file in info.path.parent.iterdir():
+                if s_file.is_file() and s_file.name.startswith(info.path.stem) and s_file.suffix.lower() in {".srt", ".vtt"}:
+                    dest_sub = out_video_path.parent / s_file.name
+                    if not dest_sub.exists():
+                        safe_copy_file(s_file, dest_sub)
+                        log(f"Copied subtitle: {s_file.name}")
+                    if s_file.name == f"{out_video_path.stem}.srt":
+                        has_exact_srt = True
+
+            # If an English subtitle exists (e.g. .en.srt) but no exact .srt, copy as .srt for default player recognition
+            if not has_exact_srt:
+                en_sub = info.path.parent / f"{info.path.stem}.en.srt"
+                std_sub = out_video_path.parent / f"{out_video_path.stem}.srt"
+                if en_sub.is_file() and not std_sub.exists():
+                    safe_copy_file(en_sub, std_sub)
+                    log(f"Normalized English subtitle for player compatibility: {std_sub.name}")
+        except Exception as e:
+            log(f"Subtitle copy notice: {e}")
+
+        info.output_path = out_video_path
+        return True, "Clean episode copied to season mirror."
 
     if not info.matches:
         log(f"No triggers found in {info.filename}. Skipping.")
@@ -274,8 +305,8 @@ def process_single_video(
                 pass
 
 class BatchProcessWorker(QObject):
-    file_started = Signal(str)
-    file_finished = Signal(str, bool, str)
+    file_started = Signal(str, int, int)
+    file_finished = Signal(str, bool, str, int, int)
     all_finished = Signal(int, int, list)
     log_message = Signal(str)
 
@@ -308,12 +339,13 @@ class BatchProcessWorker(QObject):
         else:
             items_to_process = self.video_items
 
-        for item in items_to_process:
+        total_items = len(items_to_process)
+        for idx, item in enumerate(items_to_process, 1):
             if self._is_cancelled:
                 self.log_message.emit("Batch processing cancelled by user.")
                 break
 
-            self.file_started.emit(item.filename)
+            self.file_started.emit(item.filename, idx, total_items)
             ok, msg = process_single_video(
                 item,
                 self.config,
@@ -329,6 +361,6 @@ class BatchProcessWorker(QObject):
                 item.error_msg = msg
                 error_list.append(f"{item.filename}: {msg}")
 
-            self.file_finished.emit(item.filename, ok, msg)
+            self.file_finished.emit(item.filename, ok, msg, idx, total_items)
 
         self.all_finished.emit(success_count, fail_count, error_list)
