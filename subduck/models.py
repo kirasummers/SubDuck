@@ -104,6 +104,9 @@ class CensorConfig:
     whisper_save_srt: bool = True      # Save .srt to output folder
     whisper_save_to_source: bool = True # Save .srt next to source video if writable
 
+    # System Power Management
+    inhibit_sleep: bool = True         # Prevent OS/display sleep while processing
+
 def sec_to_srt_time(sec: float) -> str:
     """Format seconds into SRT timestamp HH:MM:SS,mmm."""
     if sec < 0:

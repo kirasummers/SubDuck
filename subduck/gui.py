@@ -22,6 +22,7 @@ from subduck.processor import BatchProcessWorker, get_default_season_mirror_dir
 from subduck.profiles import load_all_profiles, save_user_profile, delete_user_profile
 from subduck.kio_resolver import resolve_network_url, get_kio_fuse_smb_root, ensure_kio_fuse_running
 from subduck.whisper_engine import transcribe_video_to_subtitles, is_whisper_available
+from subduck.power_manager import SleepInhibitor
 
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".mov", ".webm", ".ts", ".m4v"}
 
@@ -428,6 +429,15 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(whisper_group)
 
+        # Power Management Settings
+        power_group = QGroupBox("System Power Management")
+        p_layout = QVBoxLayout(power_group)
+        self.chk_inhibit_sleep = QCheckBox("Lock sleep out while processing (prevents PC suspend, sleep, and screen lock)")
+        self.chk_inhibit_sleep.setChecked(self.config.inhibit_sleep)
+        self.chk_inhibit_sleep.setToolTip("Uses systemd-inhibit and desktop power management to keep your PC awake during video rendering and AI transcription.")
+        p_layout.addWidget(self.chk_inhibit_sleep)
+        layout.addWidget(power_group)
+
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.save_and_accept)
         buttons.rejected.connect(self.reject)
@@ -467,6 +477,7 @@ class SettingsDialog(QDialog):
         self.config.whisper_device = self.combo_whisper_device.currentData()
         self.config.whisper_save_to_source = self.chk_whisper_source.isChecked()
         self.config.whisper_save_srt = self.chk_whisper_dest.isChecked()
+        self.config.inhibit_sleep = self.chk_inhibit_sleep.isChecked()
         self.accept()
 
 class MainWindow(QMainWindow):
@@ -481,6 +492,7 @@ class MainWindow(QMainWindow):
         self.video_items: List[VideoFileInfo] = []
         self.resolved_folder_path: str = ""
 
+        self.sleep_inhibitor = SleepInhibitor()
         self.scan_worker: Optional[FolderScanWorker] = None
         self.process_thread: Optional[QThread] = None
         self.process_worker: Optional[BatchProcessWorker] = None
@@ -1005,6 +1017,9 @@ class MainWindow(QMainWindow):
         self.progress_bar.setMaximum(count)
         self.progress_bar.setValue(0)
 
+        if self.config.inhibit_sleep:
+            self.sleep_inhibitor.acquire("SubDuck: Batch processing videos")
+
         src_dir = Path(self.resolved_folder_path)
 
         self.process_thread = QThread()
@@ -1081,6 +1096,10 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(True)
         self.progress_bar.setMaximum(count * 100)
         self.progress_bar.setValue(0)
+
+        if self.config.inhibit_sleep:
+            self.sleep_inhibitor.acquire("SubDuck: Transcribing audio with Whisper AI")
+
         self.lbl_status.setText(f"Starting Whisper transcription for {count} video(s)...")
 
         self.transcribe_thread = QThread()
@@ -1096,7 +1115,8 @@ class MainWindow(QMainWindow):
         self.transcribe_thread.start()
 
     def on_transcribe_file_started(self, filename: str, current: int, total: int):
-        self.lbl_status.setText(f"Transcribing ({current}/{total}): {filename}...")
+        sleep_tag = " [Sleep Inhibited]" if self.sleep_inhibitor.is_active else ""
+        self.lbl_status.setText(f"Transcribing ({current}/{total}): {filename}...{sleep_tag}")
         self.progress_bar.setMaximum(total * 100)
         self.progress_bar.setValue((current - 1) * 100)
         self.progress_bar.setFormat(f"Transcribing {current} of {total} - {filename} (0%)")
@@ -1140,6 +1160,7 @@ class MainWindow(QMainWindow):
                 break
 
     def on_transcribe_all_completed(self, succeeded: int, failed: int):
+        self.sleep_inhibitor.release()
         self.transcribe_thread.quit()
         self.transcribe_thread.wait()
         self.btn_transcribe.setEnabled(True)
@@ -1168,7 +1189,8 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Whisper Transcription Complete", f"Successfully generated subtitles for {succeeded} video file(s)!\n\nTrigger words have been detected and highlighted in the table.")
 
     def on_process_file_started(self, filename: str, current: int, total: int):
-        self.lbl_status.setText(f"Processing ({current}/{total}): {filename}...")
+        sleep_tag = " [Sleep Inhibited]" if self.sleep_inhibitor.is_active else ""
+        self.lbl_status.setText(f"Processing ({current}/{total}): {filename}...{sleep_tag}")
         self.progress_bar.setMaximum(total)
         self.progress_bar.setValue(current - 1)
         pct = int(((current - 1) / total) * 100) if total > 0 else 0
@@ -1189,6 +1211,7 @@ class MainWindow(QMainWindow):
                         status_item.setToolTip(f"Error: {msg}")
 
     def on_process_all_finished(self, success_count: int, fail_count: int, error_list: list):
+        self.sleep_inhibitor.release()
         self.process_thread.quit()
         self.process_thread.wait()
         self.btn_process.setEnabled(True)
@@ -1224,6 +1247,14 @@ class MainWindow(QMainWindow):
                     "Processing Complete",
                     f"Successfully processed and saved {success_count} video file(s)!"
                 )
+
+    def closeEvent(self, event):
+        self.sleep_inhibitor.release()
+        if self.process_worker:
+            self.process_worker.cancel()
+        if self.transcribe_worker:
+            self.transcribe_worker.cancel()
+        event.accept()
 
 def main():
     app = QApplication(sys.argv)
