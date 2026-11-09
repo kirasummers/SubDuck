@@ -274,8 +274,9 @@ class SettingsDialog(QDialog):
         season_form.setContentsMargins(20, 2, 0, 8)
 
         dest_h = QHBoxLayout()
-        default_mirror = str(get_default_season_mirror_dir(self.source_dir)) if self.source_dir else ""
-        self.edit_mirror_dir = QLineEdit(self.config.season_mirror_folder or default_mirror)
+        self.default_mirror = str(get_default_season_mirror_dir(self.source_dir)) if self.source_dir else ""
+        self.edit_mirror_dir = QLineEdit(self.config.season_mirror_folder)
+        self.edit_mirror_dir.setPlaceholderText(self.default_mirror or "Auto: Show [Trigger-Clean]/Season X")
         self.btn_mirror_browse = QPushButton("Browse...")
         self.btn_mirror_browse.clicked.connect(self.browse_mirror)
         dest_h.addWidget(self.edit_mirror_dir)
@@ -448,7 +449,8 @@ class SettingsDialog(QDialog):
         layout.addWidget(buttons)
 
     def browse_mirror(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Season Mirror Target Directory", self.edit_mirror_dir.text())
+        start_dir = self.edit_mirror_dir.text() or self.default_mirror or str(Path.home())
+        folder = QFileDialog.getExistingDirectory(self, "Select Season Mirror Target Directory", start_dir)
         if folder:
             self.edit_mirror_dir.setText(folder)
 
@@ -462,7 +464,11 @@ class SettingsDialog(QDialog):
         else:
             self.config.output_mode = "separate_suffix"
 
-        self.config.season_mirror_folder = self.edit_mirror_dir.text().strip()
+        entered_mirror = self.edit_mirror_dir.text().strip()
+        if entered_mirror == self.default_mirror:
+            self.config.season_mirror_folder = ""
+        else:
+            self.config.season_mirror_folder = entered_mirror
         self.config.copy_clean_files = self.chk_copy_clean.isChecked()
         self.config.copy_artwork = self.chk_copy_art.isChecked()
         self.config.backup_originals = self.chk_backup.isChecked()
@@ -1313,7 +1319,10 @@ class MainWindow(QMainWindow):
             )
         else:
             if self.config.output_mode == "season_mirror":
-                dest = self.config.season_mirror_folder or "Mirror Directory"
+                dest = self.config.season_mirror_folder or (
+                    str(get_default_season_mirror_dir(Path(self.resolved_folder_path)))
+                    if self.resolved_folder_path else "Mirror Directory"
+                )
                 QMessageBox.information(
                     self,
                     "Season Mirror Complete",
