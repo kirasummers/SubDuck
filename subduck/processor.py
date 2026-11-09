@@ -24,8 +24,18 @@ def append_log(msg: str):
         pass
 
 def get_default_season_mirror_dir(source_dir: Path) -> Path:
-    """Generate default mirror folder name: e.g. 'Season 1 [Trigger-Clean]'."""
+    """
+    Generate default mirror folder name:
+    If source is a season directory (e.g. '.../Series Name/Season 1'):
+      Returns '.../Series Name [Trigger-Clean]/Season 1'
+    This prevents Jellyfin from grouping original and clean episodes into the same season.
+    """
     folder_name = source_dir.name
+    if re.search(r"^(season|series|s)\s*\d+", folder_name, re.I):
+        show_dir = source_dir.parent
+        lib_dir = show_dir.parent
+        if lib_dir and lib_dir != show_dir:
+            return lib_dir / f"{show_dir.name} [Trigger-Clean]" / folder_name
     return source_dir.parent / f"{folder_name} [Trigger-Clean]"
 
 def build_output_paths(video_path: Path, config: CensorConfig) -> Tuple[Path, Path]:
@@ -90,32 +100,39 @@ def get_container_subtitle_codec(ext: str) -> Optional[str]:
         return "webvtt"
     return None
 
-def safe_copy_file(src: Path, dst: Path, progress_callback=None, chunk_size: int = 4 * 1024 * 1024):
+def safe_copy_file(src: Path, dst: Path, progress_callback=None, cancel_check=None, chunk_size: int = 4 * 1024 * 1024):
     """
     Safely copy a file, working around FUSE/SMB limitations where
     copystat (e.g. utime, xattrs) raises Errno 25 (Inappropriate ioctl for device).
     If progress_callback is provided, calls progress_callback(copied_bytes, total_bytes).
+    If cancel_check is provided and returns True, terminates copy and removes partial file.
     """
     try:
         total_size = src.stat().st_size
     except Exception:
         total_size = 0
 
-    if not progress_callback or total_size < chunk_size:
+    if not progress_callback and not cancel_check:
         shutil.copyfile(src, dst)
-        if progress_callback and total_size > 0:
-            progress_callback(total_size, total_size)
     else:
         copied = 0
         last_pct = -1
         with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
             while True:
+                if cancel_check and cancel_check():
+                    fdst.close()
+                    if dst.exists():
+                        try:
+                            dst.unlink()
+                        except Exception:
+                            pass
+                    return False
                 chunk = fsrc.read(chunk_size)
                 if not chunk:
                     break
                 fdst.write(chunk)
                 copied += len(chunk)
-                if total_size > 0:
+                if total_size > 0 and progress_callback:
                     pct = int((copied / total_size) * 100)
                     if pct != last_pct:
                         last_pct = pct
@@ -128,12 +145,27 @@ def safe_copy_file(src: Path, dst: Path, progress_callback=None, chunk_size: int
         shutil.copystat(src, dst)
     except OSError:
         pass
+    return True
 
 def copy_artwork_and_metadata(source_dir: Path, target_dir: Path, log_fn=None):
     """Copy thumbnails, posters, and NFO metadata to target directory."""
     if not source_dir.is_dir() or not target_dir.is_dir():
         return
     try:
+        # If this is a season directory, also copy show-level artwork to show-level mirror directory
+        if re.search(r"^(season|series|s)\s*\d+", source_dir.name, re.I):
+            show_src = source_dir.parent
+            show_dest = target_dir.parent
+            if show_src.is_dir() and show_dest.is_dir():
+                for item in show_src.iterdir():
+                    if item.is_file() and item.suffix.lower() in ARTWORK_EXTS:
+                        dest = show_dest / item.name
+                        if not dest.exists():
+                            safe_copy_file(item, dest)
+                            if log_fn:
+                                log_fn(f"Copied series artwork: {item.name}")
+
+        # Copy current directory artwork (season posters, fanart, etc.)
         for item in source_dir.iterdir():
             if item.is_file() and item.suffix.lower() in ARTWORK_EXTS:
                 dest = target_dir / item.name
@@ -150,6 +182,8 @@ def process_single_video(
     config: CensorConfig,
     progress_callback=None,
     copy_progress_callback=None,
+    cancel_check=None,
+    worker=None,
     log_callback=None
 ) -> Tuple[bool, str]:
     """
@@ -175,8 +209,12 @@ def process_single_video(
                 model_size=config.whisper_model,
                 device=config.whisper_device,
                 progress_callback=progress_callback,
+                cancel_check=cancel_check,
                 log_callback=log
             )
+            if cancel_check and cancel_check():
+                return False, "Cancelled by user"
+
             info.subtitle_entries = whisper_entries
             info.has_subtitles = len(whisper_entries) > 0
             info.whisper_generated = True
@@ -212,11 +250,13 @@ def process_single_video(
         if not out_video_path.exists() or out_video_path.stat().st_size != info.file_size:
             log(f"Copying clean episode to mirror folder: {info.filename}")
             try:
-                def on_copy_chunk(copied, total):
+                def on_copy_chunk(fname, copied, total):
                     if copy_progress_callback:
-                        copy_progress_callback(info.filename, copied, total)
+                        copy_progress_callback(fname, copied, total)
 
-                safe_copy_file(info.path, out_video_path, progress_callback=on_copy_chunk)
+                ok_copy = safe_copy_file(info.path, out_video_path, progress_callback=lambda c, t: on_copy_chunk(info.filename, c, t), cancel_check=cancel_check)
+                if not ok_copy or (cancel_check and cancel_check()):
+                    return False, "Cancelled by user"
             except Exception as e:
                 log(f"Error copying clean episode: {e}")
                 return False, str(e)
@@ -334,24 +374,49 @@ def process_single_video(
             cmd.extend(["-map_chapters", "0", "-map_metadata", "0", str(out_video_path)])
             return cmd
 
+        def run_proc(command: List[str]):
+            p = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if worker:
+                worker._active_proc = p
+            stdout, stderr = p.communicate()
+            if worker:
+                worker._active_proc = None
+            return p.returncode, stdout, stderr
+
         # Try with embedded subtitles
         cmd = build_cmd(can_embed)
         log(f"Running FFmpeg: {' '.join(cmd)}")
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        rc, out, err = run_proc(cmd)
+
+        if cancel_check and cancel_check():
+            if out_video_path.exists():
+                try:
+                    out_video_path.unlink()
+                except Exception:
+                    pass
+            return False, "Cancelled by user"
 
         # Fallback without subtitle embedding if container rejected codec
-        if p.returncode != 0 and can_embed:
-            log(f"Embedding subtitle rejected by container ({p.stderr[-150:].strip()}). Retrying without embedding...")
+        if rc != 0 and can_embed:
+            log(f"Embedding subtitle rejected by container ({err[-150:].strip()}). Retrying without embedding...")
             if out_video_path.exists() and out_video_path.stat().st_size == 0:
                 try:
                     out_video_path.unlink()
                 except Exception:
                     pass
             cmd_fallback = build_cmd(False)
-            p = subprocess.run(cmd_fallback, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            rc, out, err = run_proc(cmd_fallback)
 
-        if p.returncode != 0:
-            err_tail = p.stderr[-400:].strip()
+            if cancel_check and cancel_check():
+                if out_video_path.exists():
+                    try:
+                        out_video_path.unlink()
+                    except Exception:
+                        pass
+                return False, "Cancelled by user"
+
+        if rc != 0:
+            err_tail = err[-400:].strip()
             log(f"FFmpeg error:\n{err_tail}")
             if out_video_path.exists() and out_video_path.stat().st_size == 0:
                 try:
@@ -410,9 +475,15 @@ class BatchProcessWorker(QObject):
         self.config = config
         self.source_dir = source_dir
         self._is_cancelled = False
+        self._active_proc = None
 
     def cancel(self):
         self._is_cancelled = True
+        if self._active_proc:
+            try:
+                self._active_proc.terminate()
+            except Exception:
+                pass
 
     def run(self):
         success_count = 0
@@ -450,6 +521,8 @@ class BatchProcessWorker(QObject):
                 self.config,
                 progress_callback=lambda pct, cur, tot: self.whisper_progress.emit(pct, cur, tot),
                 copy_progress_callback=on_copy,
+                cancel_check=lambda: self._is_cancelled,
+                worker=self,
                 log_callback=lambda m: self.log_message.emit(m)
             )
 

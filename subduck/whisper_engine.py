@@ -137,6 +137,7 @@ def transcribe_video_to_subtitles(
     word_timestamps: bool = True,
     language: str = "en",
     progress_callback: Optional[Callable[[int, float, float], None]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
     log_callback: Optional[Callable[[str], None]] = None
 ) -> Tuple[List[SubtitleEntry], str]:
     """
@@ -173,6 +174,11 @@ def transcribe_video_to_subtitles(
         last_pct = -1
 
         for i, s in enumerate(segments, 1):
+            if cancel_check and cancel_check():
+                if log_callback:
+                    log_callback("Whisper transcription cancelled by user.")
+                break
+
             text = s.text.strip()
             if text:
                 entries.append(SubtitleEntry(

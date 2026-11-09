@@ -135,8 +135,12 @@ class WhisperTranscribeWorker(QThread):
                     model_size=self.config.whisper_model,
                     device=self.config.whisper_device,
                     progress_callback=prog_cb,
+                    cancel_check=lambda: self._is_cancelled,
                     log_callback=lambda m: self.log_message.emit(m)
                 )
+
+                if self._is_cancelled:
+                    break
 
                 item.subtitle_entries = entries
                 item.has_subtitles = len(entries) > 0
@@ -667,6 +671,13 @@ class MainWindow(QMainWindow):
         self.btn_process.clicked.connect(self.start_batch_process)
         bottom_layout.addWidget(self.btn_process)
 
+        self.btn_stop = QPushButton("Stop Processing")
+        self.btn_stop.setStyleSheet("background-color: #c0392b; color: white; font-weight: bold; padding: 7px 18px;")
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.setToolTip("Immediately stop active video processing or subtitle transcription")
+        self.btn_stop.clicked.connect(self.stop_current_operation)
+        bottom_layout.addWidget(self.btn_stop)
+
         root_layout.addLayout(bottom_layout)
 
         # Progress Bar and Status
@@ -987,6 +998,24 @@ class MainWindow(QMainWindow):
             if item:
                 item.setCheckState(Qt.Unchecked)
 
+    def stop_current_operation(self):
+        confirm = QMessageBox.question(
+            self,
+            "Confirm Stop",
+            "Are you sure you want to stop processing?\n\nCurrent operation will be aborted.",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.setText("Stopping...")
+        self.lbl_status.setText("Stopping operation... Please wait.")
+        if self.process_worker:
+            self.process_worker.cancel()
+        if self.transcribe_worker:
+            self.transcribe_worker.cancel()
+
     def start_batch_process(self):
         selected_items = []
         for row in range(self.table.rowCount()):
@@ -1016,7 +1045,10 @@ class MainWindow(QMainWindow):
             return
 
         self.btn_process.setEnabled(False)
+        self.btn_transcribe.setEnabled(False)
         self.btn_scan.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self.btn_stop.setText("Stop Processing")
         self.progress_bar.setVisible(True)
         self.progress_bar.setMaximum(count * 100)
         self.progress_bar.setValue(0)
@@ -1132,6 +1164,8 @@ class MainWindow(QMainWindow):
         self.btn_transcribe.setEnabled(False)
         self.btn_process.setEnabled(False)
         self.btn_scan.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self.btn_stop.setText("Stop Transcription")
         self.progress_bar.setVisible(True)
         self.progress_bar.setMaximum(count * 100)
         self.progress_bar.setValue(0)
@@ -1205,6 +1239,8 @@ class MainWindow(QMainWindow):
         self.btn_transcribe.setEnabled(True)
         self.btn_process.setEnabled(True)
         self.btn_scan.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.setText("Stop Processing")
         self.progress_bar.setVisible(False)
         self.lbl_status.setText(f"Whisper transcription finished: {succeeded} succeeded, {failed} failed.")
 
@@ -1258,7 +1294,10 @@ class MainWindow(QMainWindow):
         self.process_thread.quit()
         self.process_thread.wait()
         self.btn_process.setEnabled(True)
+        self.btn_transcribe.setEnabled(True)
         self.btn_scan.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.setText("Stop Processing")
         self.progress_bar.setVisible(False)
         self.lbl_status.setText(f"Batch completed: {success_count} succeeded, {fail_count} failed.")
 
