@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 from typing import List, Optional
 
-from PySide6.QtCore import Qt, QThread, Signal, Slot, QUrl
+from PySide6.QtCore import Qt, QThread, Signal, Slot, QUrl, QSize
 from PySide6.QtGui import QColor, QFont, QIcon, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QHeaderView, QSplitter, QTextEdit, QComboBox, QSpinBox, QDoubleSpinBox,
     QCheckBox, QGroupBox, QProgressBar, QMessageBox, QTabWidget, QDialog,
     QDialogButtonBox, QFormLayout, QFrame, QAbstractItemView, QInputDialog,
-    QRadioButton, QButtonGroup
+    QRadioButton, QButtonGroup, QSizePolicy
 )
 
 from subduck.models import VideoFileInfo, CensorConfig, TriggerMatch
@@ -25,6 +25,11 @@ from subduck.whisper_engine import transcribe_video_to_subtitles, is_whisper_ava
 from subduck.power_manager import SleepInhibitor
 
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".mov", ".webm", ".ts", ".m4v"}
+
+class ResizablePanel(QWidget):
+    """Panel with flexible minimum size hint allowing QSplitter to resize freely."""
+    def minimumSizeHint(self) -> QSize:
+        return QSize(80, 80)
 
 class FolderScanWorker(QThread):
     progress = Signal(int, int, str)
@@ -605,9 +610,19 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(self.lbl_stats)
 
         # Main Splitter: Video Table (Left) + Inspector Panel (Right)
-        splitter = QSplitter(Qt.Horizontal)
+        self.splitter = QSplitter(Qt.Horizontal)
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setHandleWidth(6)
+        self.splitter.setStyleSheet("""
+            QSplitter::handle {
+                background-color: #bdc3c7;
+            }
+            QSplitter::handle:hover {
+                background-color: #3498db;
+            }
+        """)
 
-        table_container = QWidget()
+        table_container = ResizablePanel()
         t_layout = QVBoxLayout(table_container)
         t_layout.setContentsMargins(0, 0, 0, 0)
 
@@ -622,15 +637,16 @@ class MainWindow(QMainWindow):
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.itemSelectionChanged.connect(self.on_table_row_selected)
         t_layout.addWidget(self.table)
-        splitter.addWidget(table_container)
+        self.splitter.addWidget(table_container)
 
-        insp_container = QWidget()
+        insp_container = ResizablePanel()
         insp_layout = QVBoxLayout(insp_container)
         insp_layout.setContentsMargins(0, 0, 0, 0)
 
         insp_header = QHBoxLayout()
         self.lbl_insp_title = QLabel("Trigger Moments Inspector")
         self.lbl_insp_title.setStyleSheet("font-weight: bold; font-size: 13px;")
+        self.lbl_insp_title.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         insp_header.addWidget(self.lbl_insp_title, 1)
 
         self.chk_reveal_inspector = QCheckBox("Reveal Uncensored")
@@ -648,10 +664,11 @@ class MainWindow(QMainWindow):
         self.insp_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         insp_layout.addWidget(self.insp_table)
 
-        splitter.addWidget(insp_container)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        root_layout.addWidget(splitter, 1)
+        self.splitter.addWidget(insp_container)
+        self.splitter.setStretchFactor(0, 3)
+        self.splitter.setStretchFactor(1, 2)
+        self.splitter.setSizes([700, 480])
+        root_layout.addWidget(self.splitter, 1)
 
         # Bottom Action Bar
         bottom_layout = QHBoxLayout()
@@ -680,6 +697,7 @@ class MainWindow(QMainWindow):
         self.btn_stop = QPushButton("Stop Processing")
         self.btn_stop.setStyleSheet("background-color: #c0392b; color: white; font-weight: bold; padding: 7px 18px;")
         self.btn_stop.setEnabled(False)
+        self.btn_stop.setVisible(False)
         self.btn_stop.setToolTip("Immediately stop active video processing or subtitle transcription")
         self.btn_stop.clicked.connect(self.stop_current_operation)
         bottom_layout.addWidget(self.btn_stop)
@@ -959,12 +977,15 @@ class MainWindow(QMainWindow):
         if not rows:
             self.insp_table.setRowCount(0)
             self.lbl_insp_title.setText("Trigger Moments Inspector")
+            self.lbl_insp_title.setToolTip("")
             return
 
         idx = rows[0].row()
         if 0 <= idx < len(self.video_items):
             info = self.video_items[idx]
-            self.lbl_insp_title.setText(f"Trigger Moments: {info.filename} ({len(info.matches)} detected)")
+            title_text = f"Trigger Moments: {info.filename} ({len(info.matches)} detected)"
+            self.lbl_insp_title.setText(title_text)
+            self.lbl_insp_title.setToolTip(title_text)
             self.insp_table.setRowCount(0)
             reveal = getattr(self, "chk_reveal_inspector", None) and self.chk_reveal_inspector.isChecked()
 
@@ -1050,10 +1071,12 @@ class MainWindow(QMainWindow):
         if confirm != QMessageBox.Yes:
             return
 
+        self.btn_process.setVisible(False)
         self.btn_process.setEnabled(False)
         self.btn_transcribe.setEnabled(False)
         self.btn_scan.setEnabled(False)
         self.btn_stop.setEnabled(True)
+        self.btn_stop.setVisible(True)
         self.btn_stop.setText("Stop Processing")
         self.progress_bar.setVisible(True)
         self.progress_bar.setMaximum(count * 100)
@@ -1168,9 +1191,11 @@ class MainWindow(QMainWindow):
             return
 
         self.btn_transcribe.setEnabled(False)
+        self.btn_process.setVisible(False)
         self.btn_process.setEnabled(False)
         self.btn_scan.setEnabled(False)
         self.btn_stop.setEnabled(True)
+        self.btn_stop.setVisible(True)
         self.btn_stop.setText("Stop Transcription")
         self.progress_bar.setVisible(True)
         self.progress_bar.setMaximum(count * 100)
@@ -1243,9 +1268,11 @@ class MainWindow(QMainWindow):
         self.transcribe_thread.quit()
         self.transcribe_thread.wait()
         self.btn_transcribe.setEnabled(True)
+        self.btn_stop.setVisible(False)
+        self.btn_stop.setEnabled(False)
+        self.btn_process.setVisible(True)
         self.btn_process.setEnabled(True)
         self.btn_scan.setEnabled(True)
-        self.btn_stop.setEnabled(False)
         self.btn_stop.setText("Stop Processing")
         self.progress_bar.setVisible(False)
         self.lbl_status.setText(f"Whisper transcription finished: {succeeded} succeeded, {failed} failed.")
@@ -1299,10 +1326,12 @@ class MainWindow(QMainWindow):
         self.sleep_inhibitor.release()
         self.process_thread.quit()
         self.process_thread.wait()
+        self.btn_stop.setVisible(False)
+        self.btn_stop.setEnabled(False)
+        self.btn_process.setVisible(True)
         self.btn_process.setEnabled(True)
         self.btn_transcribe.setEnabled(True)
         self.btn_scan.setEnabled(True)
-        self.btn_stop.setEnabled(False)
         self.btn_stop.setText("Stop Processing")
         self.progress_bar.setVisible(False)
         self.lbl_status.setText(f"Batch completed: {success_count} succeeded, {fail_count} failed.")
