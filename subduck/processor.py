@@ -90,12 +90,40 @@ def get_container_subtitle_codec(ext: str) -> Optional[str]:
         return "webvtt"
     return None
 
-def safe_copy_file(src: Path, dst: Path):
+def safe_copy_file(src: Path, dst: Path, progress_callback=None, chunk_size: int = 4 * 1024 * 1024):
     """
     Safely copy a file, working around FUSE/SMB limitations where
     copystat (e.g. utime, xattrs) raises Errno 25 (Inappropriate ioctl for device).
+    If progress_callback is provided, calls progress_callback(copied_bytes, total_bytes).
     """
-    shutil.copyfile(src, dst)
+    try:
+        total_size = src.stat().st_size
+    except Exception:
+        total_size = 0
+
+    if not progress_callback or total_size < chunk_size:
+        shutil.copyfile(src, dst)
+        if progress_callback and total_size > 0:
+            progress_callback(total_size, total_size)
+    else:
+        copied = 0
+        last_pct = -1
+        with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+            while True:
+                chunk = fsrc.read(chunk_size)
+                if not chunk:
+                    break
+                fdst.write(chunk)
+                copied += len(chunk)
+                if total_size > 0:
+                    pct = int((copied / total_size) * 100)
+                    if pct != last_pct:
+                        last_pct = pct
+                        progress_callback(copied, total_size)
+
+        if progress_callback:
+            progress_callback(copied, total_size)
+
     try:
         shutil.copystat(src, dst)
     except OSError:
@@ -121,6 +149,7 @@ def process_single_video(
     info: VideoFileInfo,
     config: CensorConfig,
     progress_callback=None,
+    copy_progress_callback=None,
     log_callback=None
 ) -> Tuple[bool, str]:
     """
@@ -183,7 +212,11 @@ def process_single_video(
         if not out_video_path.exists() or out_video_path.stat().st_size != info.file_size:
             log(f"Copying clean episode to mirror folder: {info.filename}")
             try:
-                safe_copy_file(info.path, out_video_path)
+                def on_copy_chunk(copied, total):
+                    if copy_progress_callback:
+                        copy_progress_callback(info.filename, copied, total)
+
+                safe_copy_file(info.path, out_video_path, progress_callback=on_copy_chunk)
             except Exception as e:
                 log(f"Error copying clean episode: {e}")
                 return False, str(e)
@@ -367,6 +400,8 @@ class BatchProcessWorker(QObject):
     all_finished = Signal(int, int, list)
     log_message = Signal(str)
     whisper_progress = Signal(int, float, float)
+    copy_progress = Signal(str, int, int, int)
+    status_update = Signal(str)
 
     def __init__(self, video_items: List[VideoFileInfo], all_scanned_items: List[VideoFileInfo], config: CensorConfig, source_dir: Path):
         super().__init__()
@@ -386,10 +421,12 @@ class BatchProcessWorker(QObject):
 
         # If Season Mirror Mode, ensure the mirror destination exists and copy artwork first
         if self.config.output_mode == "season_mirror":
+            self.status_update.emit("Setting up Season Mirror directory...")
             mirror_dir = Path(self.config.season_mirror_folder) if self.config.season_mirror_folder else get_default_season_mirror_dir(self.source_dir)
             mirror_dir.mkdir(parents=True, exist_ok=True)
             self.log_message.emit(f"Season Mirror Directory: {mirror_dir}")
             if self.config.copy_artwork:
+                self.status_update.emit("Copying posters, artwork, and metadata...")
                 copy_artwork_and_metadata(self.source_dir, mirror_dir, log_fn=lambda m: self.log_message.emit(m))
 
             items_to_process = self.all_scanned_items
@@ -403,10 +440,16 @@ class BatchProcessWorker(QObject):
                 break
 
             self.file_started.emit(item.filename, idx, total_items)
+
+            def on_copy(fname: str, copied: int, tot: int):
+                pct = int((copied / tot) * 100) if tot > 0 else 0
+                self.copy_progress.emit(fname, copied, tot, pct)
+
             ok, msg = process_single_video(
                 item,
                 self.config,
                 progress_callback=lambda pct, cur, tot: self.whisper_progress.emit(pct, cur, tot),
+                copy_progress_callback=on_copy,
                 log_callback=lambda m: self.log_message.emit(m)
             )
 

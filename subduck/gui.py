@@ -499,6 +499,10 @@ class MainWindow(QMainWindow):
         self.transcribe_thread: Optional[QThread] = None
         self.transcribe_worker: Optional[WhisperTranscribeWorker] = None
 
+        self._batch_current_file: str = ""
+        self._batch_current_index: int = 0
+        self._batch_total_items: int = 0
+
         ensure_kio_fuse_running()
         self.setup_ui()
         self.load_initial_profile()
@@ -1014,8 +1018,12 @@ class MainWindow(QMainWindow):
         self.btn_process.setEnabled(False)
         self.btn_scan.setEnabled(False)
         self.progress_bar.setVisible(True)
-        self.progress_bar.setMaximum(count)
+        self.progress_bar.setMaximum(count * 100)
         self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("Setting up and preparing files... (0%)")
+
+        sleep_tag = " [Sleep Inhibited]" if self.config.inhibit_sleep else ""
+        self.lbl_status.setText(f"Setting up batch processing...{sleep_tag}")
 
         if self.config.inhibit_sleep:
             self.sleep_inhibitor.acquire("SubDuck: Batch processing videos")
@@ -1036,13 +1044,44 @@ class MainWindow(QMainWindow):
         self.process_worker.file_finished.connect(self.on_process_file_finished)
         self.process_worker.all_finished.connect(self.on_process_all_finished)
         self.process_worker.whisper_progress.connect(self.on_process_whisper_progress)
+        self.process_worker.copy_progress.connect(self.on_process_copy_progress)
+        self.process_worker.status_update.connect(self.on_process_status_update)
 
         self.process_thread.start()
 
+    def on_process_status_update(self, msg: str):
+        sleep_tag = " [Sleep Inhibited]" if self.sleep_inhibitor.is_active else ""
+        self.lbl_status.setText(f"{msg}{sleep_tag}")
+        self.progress_bar.setFormat(f"{msg}")
+
+    def on_process_copy_progress(self, filename: str, copied: int, total_b: int, pct: int):
+        total_items = max(1, self._batch_total_items)
+        current_idx = max(1, self._batch_current_index)
+        base_val = (current_idx - 1) * 100
+        overall_val = base_val + int(pct)
+        self.progress_bar.setValue(overall_val)
+
+        copied_mb = copied / (1024 * 1024)
+        total_mb = total_b / (1024 * 1024)
+        if total_mb >= 1024:
+            size_str = f"{copied_mb / 1024:.2f} GB / {total_mb / 1024:.2f} GB"
+        else:
+            size_str = f"{copied_mb:.1f} MB / {total_mb:.1f} MB"
+
+        self.progress_bar.setFormat(f"Copying episode {current_idx} of {total_items}: {pct}% ({size_str})")
+        sleep_tag = " [Sleep Inhibited]" if self.sleep_inhibitor.is_active else ""
+        self.lbl_status.setText(f"Copying clean episode ({current_idx}/{total_items}): {size_str} ({pct}%)...{sleep_tag}")
+
     def on_process_whisper_progress(self, pct: int, cur_s: float, tot_s: float):
+        total_items = max(1, self._batch_total_items)
+        current_idx = max(1, self._batch_current_index)
+        base_val = (current_idx - 1) * 100
+        overall_val = base_val + int(pct)
+        self.progress_bar.setValue(overall_val)
+
         cur_min, cur_sec = divmod(int(cur_s), 60)
         tot_min, tot_sec = divmod(int(tot_s), 60)
-        self.progress_bar.setFormat(f"Whisper AI: {pct}% ({cur_min}:{cur_sec:02d} / {tot_min}:{tot_sec:02d})")
+        self.progress_bar.setFormat(f"Whisper AI ({current_idx}/{total_items}): {pct}% ({cur_min}:{cur_sec:02d} / {tot_min}:{tot_sec:02d})")
 
     def start_whisper_transcription(self):
         if not is_whisper_available():
@@ -1189,17 +1228,21 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Whisper Transcription Complete", f"Successfully generated subtitles for {succeeded} video file(s)!\n\nTrigger words have been detected and highlighted in the table.")
 
     def on_process_file_started(self, filename: str, current: int, total: int):
+        self._batch_current_file = filename
+        self._batch_current_index = current
+        self._batch_total_items = total
         sleep_tag = " [Sleep Inhibited]" if self.sleep_inhibitor.is_active else ""
         self.lbl_status.setText(f"Processing ({current}/{total}): {filename}...{sleep_tag}")
-        self.progress_bar.setMaximum(total)
-        self.progress_bar.setValue(current - 1)
-        pct = int(((current - 1) / total) * 100) if total > 0 else 0
-        self.progress_bar.setFormat(f"Processing {current} of {total} ({pct}%) - {filename}")
+        self.progress_bar.setMaximum(total * 100)
+        base_val = (current - 1) * 100
+        self.progress_bar.setValue(base_val)
+        overall_pct = int((base_val / (total * 100)) * 100) if total > 0 else 0
+        self.progress_bar.setFormat(f"Processing {current} of {total} ({overall_pct}%) - {filename}")
 
     def on_process_file_finished(self, filename: str, success: bool, msg: str, current: int, total: int):
-        self.progress_bar.setValue(current)
-        pct = int((current / total) * 100) if total > 0 else 100
-        self.progress_bar.setFormat(f"Completed {current} of {total} ({pct}%)")
+        self.progress_bar.setValue(current * 100)
+        overall_pct = int((current / total) * 100) if total > 0 else 100
+        self.progress_bar.setFormat(f"Completed {current} of {total} ({overall_pct}%)")
         for row in range(self.table.rowCount()):
             item_f = self.table.item(row, 1)
             if item_f and item_f.text() == filename:
