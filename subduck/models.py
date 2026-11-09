@@ -37,9 +37,12 @@ class VideoFileInfo:
     resolution: str = ""
     has_subtitles: bool = False
     subtitle_source: str = "None"
+    has_bitmap_subtitles: bool = False
+    bitmap_codec: str = ""
+    whisper_generated: bool = False
     subtitle_entries: List[SubtitleEntry] = field(default_factory=list)
     matches: List[TriggerMatch] = field(default_factory=list)
-    status: str = "Unscanned"  # Unscanned, Clean, Flagged, No Subtitles, Done, Error
+    status: str = "Unscanned"  # Unscanned, Clean, Flagged, No Subtitles, Bitmap Subs, Done, Error
     output_path: Optional[Path] = None
     error_msg: str = ""
 
@@ -93,6 +96,13 @@ class CensorConfig:
     save_srt: bool = True
     embed_sub: bool = True
     subtitle_lang: str = "eng"
+
+    # AI Whisper Subtitle Generation Settings
+    whisper_mode: str = "if_missing"  # "if_missing", "always", "disabled"
+    whisper_model: str = "base.en"     # "tiny.en", "base.en", "small.en", "medium.en", "large-v3"
+    whisper_device: str = "auto"       # "auto", "cuda", "cpu"
+    whisper_save_srt: bool = True      # Save .srt to output folder
+    whisper_save_to_source: bool = True # Save .srt next to source video if writable
 
 def sec_to_srt_time(sec: float) -> str:
     """Format seconds into SRT timestamp HH:MM:SS,mmm."""

@@ -21,6 +21,7 @@ from subduck.matcher import scan_subtitles_for_triggers
 from subduck.processor import BatchProcessWorker, get_default_season_mirror_dir
 from subduck.profiles import load_all_profiles, save_user_profile, delete_user_profile
 from subduck.kio_resolver import resolve_network_url, get_kio_fuse_smb_root, ensure_kio_fuse_running
+from subduck.whisper_engine import transcribe_video_to_subtitles, is_whisper_available
 
 VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".mov", ".webm", ".ts", ".m4v"}
 
@@ -69,10 +70,12 @@ class FolderScanWorker(QThread):
                 duration_sec=duration
             )
 
-            sub_entries, sub_desc = extract_subtitles_from_video(v_path, self.config.subtitle_lang)
+            sub_entries, sub_desc, has_bitmap, bitmap_codec = extract_subtitles_from_video(v_path, self.config.subtitle_lang)
             info.subtitle_entries = sub_entries
             info.subtitle_source = sub_desc
             info.has_subtitles = len(sub_entries) > 0
+            info.has_bitmap_subtitles = has_bitmap
+            info.bitmap_codec = bitmap_codec
 
             if info.has_subtitles and self.config.trigger_words:
                 matches = scan_subtitles_for_triggers(sub_entries, self.config)
@@ -81,15 +84,92 @@ class FolderScanWorker(QThread):
                     info.status = f"Flagged ({info.trigger_count})"
                 else:
                     info.status = "Clean"
-            elif not info.has_subtitles:
-                info.status = "No Subtitles"
-            else:
+            elif info.has_subtitles:
                 info.status = "Clean"
+            elif info.has_bitmap_subtitles:
+                info.status = f"Bitmap ({bitmap_codec})"
+            else:
+                info.status = "No Subtitles"
 
             results.append(info)
             self.file_found.emit(info)
 
         self.scan_finished.emit(results)
+
+class WhisperTranscribeWorker(QThread):
+    file_started = Signal(str, int, int)
+    file_progress = Signal(str, int, float, float)
+    file_completed = Signal(object, bool, str, int, int)
+    all_completed = Signal(int, int)
+    log_message = Signal(str)
+
+    def __init__(self, target_items: List[VideoFileInfo], config: CensorConfig):
+        super().__init__()
+        self.target_items = target_items
+        self.config = config
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
+
+    def run(self):
+        total = len(self.target_items)
+        succeeded = 0
+        failed = 0
+
+        for idx, item in enumerate(self.target_items, 1):
+            if self._is_cancelled:
+                self.log_message.emit("Transcription cancelled by user.")
+                break
+
+            self.file_started.emit(item.filename, idx, total)
+            self.log_message.emit(f"Transcribing ({idx}/{total}): {item.filename} with Whisper ({self.config.whisper_model})...")
+
+            try:
+                def prog_cb(pct, cur_s, tot_s):
+                    self.file_progress.emit(item.filename, pct, cur_s, tot_s)
+
+                entries, raw_srt = transcribe_video_to_subtitles(
+                    item.path,
+                    model_size=self.config.whisper_model,
+                    device=self.config.whisper_device,
+                    progress_callback=prog_cb,
+                    log_callback=lambda m: self.log_message.emit(m)
+                )
+
+                item.subtitle_entries = entries
+                item.has_subtitles = len(entries) > 0
+                item.whisper_generated = True
+                item.subtitle_source = f"Whisper AI ({self.config.whisper_model})"
+
+                # Try saving raw generated SRT next to original if configured
+                if self.config.whisper_save_to_source and raw_srt:
+                    try:
+                        src_srt = item.path.parent / f"{item.path.stem}.srt"
+                        if not src_srt.exists():
+                            src_srt.write_text(raw_srt, encoding="utf-8")
+                            self.log_message.emit(f"Saved generated subtitle to: {src_srt.name}")
+                    except Exception as e:
+                        self.log_message.emit(f"Could not write SRT to source dir: {e}")
+
+                if self.config.trigger_words:
+                    item.matches = scan_subtitles_for_triggers(entries, self.config)
+                    if item.matches:
+                        item.status = f"Flagged ({item.trigger_count})"
+                    else:
+                        item.status = "Clean"
+                else:
+                    item.status = "Clean"
+
+                succeeded += 1
+                self.file_completed.emit(item, True, "Transcription complete", idx, total)
+
+            except Exception as e:
+                failed += 1
+                self.log_message.emit(f"Error transcribing {item.filename}: {e}")
+                self.file_completed.emit(item, False, str(e), idx, total)
+
+        self.all_completed.emit(succeeded, failed)
 
 class TriggerEditorDialog(QDialog):
     """Protected modal dialog for configuring trigger words away from main view."""
@@ -305,6 +385,49 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(audio_group)
 
+        # AI Whisper Subtitle Transcription Settings
+        whisper_group = QGroupBox("AI Speech-to-Text Subtitle Generation (faster-whisper)")
+        w_form = QFormLayout(whisper_group)
+
+        self.combo_whisper_mode = QComboBox()
+        self.combo_whisper_mode.addItem("Generate if missing or bitmap-only (Recommended)", "if_missing")
+        self.combo_whisper_mode.addItem("Always generate with Whisper (Transcribe all)", "always")
+        self.combo_whisper_mode.addItem("Disabled (Only use existing text subtitles)", "disabled")
+        w_mode_idx = self.combo_whisper_mode.findData(self.config.whisper_mode)
+        if w_mode_idx >= 0:
+            self.combo_whisper_mode.setCurrentIndex(w_mode_idx)
+        w_form.addRow("Whisper Trigger Mode:", self.combo_whisper_mode)
+
+        self.combo_whisper_model = QComboBox()
+        self.combo_whisper_model.addItem("base.en (~60x real-time on GPU, ~150 MB) [Recommended]", "base.en")
+        self.combo_whisper_model.addItem("tiny.en (Ultra-fast - ~100x real-time, ~75 MB)", "tiny.en")
+        self.combo_whisper_model.addItem("small.en (Higher accuracy - ~35x real-time, ~500 MB)", "small.en")
+        self.combo_whisper_model.addItem("medium.en (Maximum accuracy - ~18x real-time, ~1.5 GB)", "medium.en")
+        self.combo_whisper_model.addItem("large-v3 (Multilingual flagship, ~3 GB)", "large-v3")
+        w_model_idx = self.combo_whisper_model.findData(self.config.whisper_model)
+        if w_model_idx >= 0:
+            self.combo_whisper_model.setCurrentIndex(w_model_idx)
+        w_form.addRow("Whisper Model:", self.combo_whisper_model)
+
+        self.combo_whisper_device = QComboBox()
+        self.combo_whisper_device.addItem("Auto-detect (NVIDIA CUDA GPU preferred)", "auto")
+        self.combo_whisper_device.addItem("NVIDIA CUDA GPU (float16)", "cuda")
+        self.combo_whisper_device.addItem("CPU (int8 multi-core)", "cpu")
+        w_dev_idx = self.combo_whisper_device.findData(self.config.whisper_device)
+        if w_dev_idx >= 0:
+            self.combo_whisper_device.setCurrentIndex(w_dev_idx)
+        w_form.addRow("Inference Device:", self.combo_whisper_device)
+
+        self.chk_whisper_source = QCheckBox("Save generated .srt alongside source video (if writable)")
+        self.chk_whisper_source.setChecked(self.config.whisper_save_to_source)
+        w_form.addRow("Save to Source Folder:", self.chk_whisper_source)
+
+        self.chk_whisper_dest = QCheckBox("Save generated .srt to output mirror folder")
+        self.chk_whisper_dest.setChecked(self.config.whisper_save_srt)
+        w_form.addRow("Save to Output Folder:", self.chk_whisper_dest)
+
+        layout.addWidget(whisper_group)
+
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.save_and_accept)
         buttons.rejected.connect(self.reject)
@@ -338,6 +461,12 @@ class SettingsDialog(QDialog):
         self.config.strict_matching = self.chk_strict.isChecked()
         self.config.save_srt = self.chk_save_srt.isChecked()
         self.config.embed_sub = self.chk_embed_sub.isChecked()
+
+        self.config.whisper_mode = self.combo_whisper_mode.currentData()
+        self.config.whisper_model = self.combo_whisper_model.currentData()
+        self.config.whisper_device = self.combo_whisper_device.currentData()
+        self.config.whisper_save_to_source = self.chk_whisper_source.isChecked()
+        self.config.whisper_save_srt = self.chk_whisper_dest.isChecked()
         self.accept()
 
 class MainWindow(QMainWindow):
@@ -355,6 +484,8 @@ class MainWindow(QMainWindow):
         self.scan_worker: Optional[FolderScanWorker] = None
         self.process_thread: Optional[QThread] = None
         self.process_worker: Optional[BatchProcessWorker] = None
+        self.transcribe_thread: Optional[QThread] = None
+        self.transcribe_worker: Optional[WhisperTranscribeWorker] = None
 
         ensure_kio_fuse_running()
         self.setup_ui()
@@ -507,6 +638,12 @@ class MainWindow(QMainWindow):
         self.btn_select_none.clicked.connect(self.select_none)
         bottom_layout.addWidget(self.btn_select_none)
 
+        self.btn_transcribe = QPushButton("Transcribe with Whisper (GPU)")
+        self.btn_transcribe.setToolTip("Generate text subtitles from video audio using GPU-accelerated Whisper AI")
+        self.btn_transcribe.setStyleSheet("font-weight: 500; padding: 6px 14px; background-color: #2c3e50; color: white;")
+        self.btn_transcribe.clicked.connect(self.start_whisper_transcription)
+        bottom_layout.addWidget(self.btn_transcribe)
+
         bottom_layout.addStretch()
 
         self.btn_process = QPushButton("Process Complete Season")
@@ -603,16 +740,20 @@ class MainWindow(QMainWindow):
 
     def refresh_table(self):
         self.table.setRowCount(0)
-        for info in self.video_items:
+        items_copy = list(self.video_items)
+        self.video_items = []
+        for info in items_copy:
             self.on_file_found(info)
         total = len(self.video_items)
         with_subs = sum(1 for r in self.video_items if r.has_subtitles)
+        with_bitmap = sum(1 for r in self.video_items if r.has_bitmap_subtitles and not r.has_subtitles)
         with_triggers = sum(1 for r in self.video_items if r.matches)
         total_triggers = sum(r.trigger_count for r in self.video_items)
-        self.lbl_stats.setText(
-            f"Found {total} Video File(s)  |  {with_subs} with Subtitles  |  "
-            f"{with_triggers} with Trigger Words ({total_triggers} total instances detected)"
-        )
+        stat_msg = f"Found {total} Video File(s)  |  {with_subs} with Subtitles"
+        if with_bitmap > 0:
+            stat_msg += f"  |  {with_bitmap} with Bitmap Subs (Whisper Ready)"
+        stat_msg += f"  |  {with_triggers} with Trigger Words ({total_triggers} total instances detected)"
+        self.lbl_stats.setText(stat_msg)
         if self.table.rowCount() > 0:
             self.table.selectRow(0)
 
@@ -730,6 +871,10 @@ class MainWindow(QMainWindow):
         if info.has_subtitles:
             sub_item.setText(info.subtitle_source)
             sub_item.setForeground(QColor("#27ae60"))
+        elif info.has_bitmap_subtitles:
+            sub_item.setText(f"{info.subtitle_source} (Whisper Ready)")
+            sub_item.setForeground(QColor("#d35400"))
+            sub_item.setToolTip("Image bitmap subtitles (e.g. PGS Blu-ray) cannot be read directly as text. Use Whisper to transcribe.")
         else:
             sub_item.setText("No Subtitles")
             sub_item.setForeground(QColor("#e74c3c"))
@@ -745,6 +890,9 @@ class MainWindow(QMainWindow):
         elif info.has_subtitles:
             trig_item.setText("Clean")
             trig_item.setForeground(QColor("#2ecc71"))
+        elif info.has_bitmap_subtitles:
+            trig_item.setText("Ready for Whisper")
+            trig_item.setForeground(QColor("#d35400"))
         else:
             trig_item.setText("-")
             trig_item.setForeground(QColor("#95a5a6"))
@@ -760,13 +908,15 @@ class MainWindow(QMainWindow):
 
         total = len(results)
         with_subs = sum(1 for r in results if r.has_subtitles)
+        with_bitmap = sum(1 for r in results if r.has_bitmap_subtitles and not r.has_subtitles)
         with_triggers = sum(1 for r in results if r.matches)
         total_triggers = sum(r.trigger_count for r in results)
 
-        self.lbl_stats.setText(
-            f"Found {total} Video File(s)  |  {with_subs} with Subtitles  |  "
-            f"{with_triggers} with Trigger Words ({total_triggers} total instances detected)"
-        )
+        stat_msg = f"Found {total} Video File(s)  |  {with_subs} with Subtitles"
+        if with_bitmap > 0:
+            stat_msg += f"  |  {with_bitmap} with Bitmap Subs (Whisper Ready)"
+        stat_msg += f"  |  {with_triggers} with Trigger Words ({total_triggers} total instances detected)"
+        self.lbl_stats.setText(stat_msg)
 
         if self.table.rowCount() > 0:
             self.table.selectRow(0)
@@ -870,8 +1020,152 @@ class MainWindow(QMainWindow):
         self.process_worker.file_started.connect(self.on_process_file_started)
         self.process_worker.file_finished.connect(self.on_process_file_finished)
         self.process_worker.all_finished.connect(self.on_process_all_finished)
+        self.process_worker.whisper_progress.connect(self.on_process_whisper_progress)
 
         self.process_thread.start()
+
+    def on_process_whisper_progress(self, pct: int, cur_s: float, tot_s: float):
+        cur_min, cur_sec = divmod(int(cur_s), 60)
+        tot_min, tot_sec = divmod(int(tot_s), 60)
+        self.progress_bar.setFormat(f"Whisper AI: {pct}% ({cur_min}:{cur_sec:02d} / {tot_min}:{tot_sec:02d})")
+
+    def start_whisper_transcription(self):
+        if not is_whisper_available():
+            QMessageBox.critical(self, "Whisper Unavailable", "faster-whisper is not installed in the environment.")
+            return
+
+        # Check which files to transcribe
+        checked_indices = []
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item and item.checkState() == Qt.Checked and row < len(self.video_items):
+                checked_indices.append(row)
+
+        target_items = []
+        if checked_indices:
+            target_items = [self.video_items[r] for r in checked_indices]
+        else:
+            missing_items = [v for v in self.video_items if not v.has_subtitles]
+            if not missing_items:
+                rows = self.table.selectionModel().selectedRows()
+                if rows and rows[0].row() < len(self.video_items):
+                    target_items = [self.video_items[rows[0].row()]]
+                else:
+                    QMessageBox.information(
+                        self,
+                        "All Files Have Subtitles",
+                        "All loaded videos already have text subtitles.\n\n"
+                        "To force re-transcribe specific videos, check their checkboxes in the table first."
+                    )
+                    return
+            else:
+                target_items = missing_items
+
+        count = len(target_items)
+        confirm = QMessageBox.question(
+            self,
+            "Confirm Whisper AI Transcription",
+            f"Transcribe {count} video file(s) using Whisper AI?\n\n"
+            f"• Model: {self.config.whisper_model}\n"
+            f"• Inference Device: {self.config.whisper_device}\n"
+            f"• Speed: ~60x faster than real-time on GPU\n\n"
+            f"Subtitles will be extracted and scanned for triggers immediately.",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        self.btn_transcribe.setEnabled(False)
+        self.btn_process.setEnabled(False)
+        self.btn_scan.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setMaximum(count * 100)
+        self.progress_bar.setValue(0)
+        self.lbl_status.setText(f"Starting Whisper transcription for {count} video(s)...")
+
+        self.transcribe_thread = QThread()
+        self.transcribe_worker = WhisperTranscribeWorker(target_items, self.config)
+        self.transcribe_worker.moveToThread(self.transcribe_thread)
+
+        self.transcribe_thread.started.connect(self.transcribe_worker.run)
+        self.transcribe_worker.file_started.connect(self.on_transcribe_file_started)
+        self.transcribe_worker.file_progress.connect(self.on_transcribe_chunk_progress)
+        self.transcribe_worker.file_completed.connect(self.on_transcribe_file_completed)
+        self.transcribe_worker.all_completed.connect(self.on_transcribe_all_completed)
+
+        self.transcribe_thread.start()
+
+    def on_transcribe_file_started(self, filename: str, current: int, total: int):
+        self.lbl_status.setText(f"Transcribing ({current}/{total}): {filename}...")
+        self.progress_bar.setMaximum(total * 100)
+        self.progress_bar.setValue((current - 1) * 100)
+        self.progress_bar.setFormat(f"Transcribing {current} of {total} - {filename} (0%)")
+
+    def on_transcribe_chunk_progress(self, filename: str, pct: int, cur_s: float, tot_s: float):
+        total_files = len(self.transcribe_worker.target_items) if self.transcribe_worker else 1
+        current_file_idx = 1
+        for idx, item in enumerate(self.transcribe_worker.target_items, 1):
+            if item.filename == filename:
+                current_file_idx = idx
+                break
+        overall_val = int((current_file_idx - 1) * 100 + pct)
+        self.progress_bar.setValue(overall_val)
+        cur_min, cur_sec = divmod(int(cur_s), 60)
+        tot_min, tot_sec = divmod(int(tot_s), 60)
+        self.progress_bar.setFormat(f"Transcribing {current_file_idx} of {total_files}: {pct}% ({cur_min}:{cur_sec:02d}/{tot_min}:{tot_sec:02d})")
+
+    def on_transcribe_file_completed(self, info: VideoFileInfo, success: bool, msg: str, current: int, total: int):
+        self.progress_bar.setValue(current * 100)
+        for row in range(self.table.rowCount()):
+            item_f = self.table.item(row, 1)
+            if item_f and item_f.text() == info.filename:
+                chk = self.table.item(row, 0)
+                if chk:
+                    chk.setCheckState(Qt.Checked if info.matches else Qt.Unchecked)
+                sub_item = self.table.item(row, 2)
+                if sub_item:
+                    sub_item.setText(info.subtitle_source)
+                    sub_item.setForeground(QColor("#27ae60"))
+                trig_item = self.table.item(row, 3)
+                if trig_item:
+                    if info.matches:
+                        trig_item.setText(f"{info.trigger_count} trigger match(es)")
+                        trig_item.setForeground(QColor("#e67e22"))
+                        f = trig_item.font()
+                        f.setBold(True)
+                        trig_item.setFont(f)
+                    else:
+                        trig_item.setText("Clean")
+                        trig_item.setForeground(QColor("#2ecc71"))
+                break
+
+    def on_transcribe_all_completed(self, succeeded: int, failed: int):
+        self.transcribe_thread.quit()
+        self.transcribe_thread.wait()
+        self.btn_transcribe.setEnabled(True)
+        self.btn_process.setEnabled(True)
+        self.btn_scan.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.lbl_status.setText(f"Whisper transcription finished: {succeeded} succeeded, {failed} failed.")
+
+        total = len(self.video_items)
+        with_subs = sum(1 for r in self.video_items if r.has_subtitles)
+        with_bitmap = sum(1 for r in self.video_items if r.has_bitmap_subtitles and not r.has_subtitles)
+        with_triggers = sum(1 for r in self.video_items if r.matches)
+        total_triggers = sum(r.trigger_count for r in self.video_items)
+
+        stat_msg = f"Found {total} Video File(s)  |  {with_subs} with Subtitles"
+        if with_bitmap > 0:
+            stat_msg += f"  |  {with_bitmap} with Bitmap Subs (Whisper Ready)"
+        stat_msg += f"  |  {with_triggers} with Trigger Words ({total_triggers} total instances detected)"
+        self.lbl_stats.setText(stat_msg)
+
+        self.on_table_row_selected()
+
+        if failed > 0:
+            QMessageBox.warning(self, "Transcription Finished with Warnings", f"Whisper transcribed {succeeded} file(s), but {failed} file(s) failed.")
+        else:
+            QMessageBox.information(self, "Whisper Transcription Complete", f"Successfully generated subtitles for {succeeded} video file(s)!\n\nTrigger words have been detected and highlighted in the table.")
 
     def on_process_file_started(self, filename: str, current: int, total: int):
         self.lbl_status.setText(f"Processing ({current}/{total}): {filename}...")

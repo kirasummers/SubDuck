@@ -24,8 +24,8 @@ def resolve_network_url(url_or_path: str) -> str:
     if not clean_str:
         return clean_str
 
-    # If it is already a valid local POSIX directory, return it as-is
-    if os.path.isdir(clean_str):
+    # If it is already a valid local POSIX path, return it as-is
+    if os.path.exists(clean_str):
         return clean_str
 
     # Check if it is a KIO network URL
@@ -45,11 +45,11 @@ def resolve_network_url(url_or_path: str) -> str:
                 # Parse gdbus response: ('/run/user/1000/kio-fuse-.../smb/...',)
                 if out.startswith("('") and out.endswith("',)"):
                     local_path = out[2:-3]
-                    if os.path.isdir(local_path):
+                    if os.path.exists(local_path):
                         return local_path
                 elif out.startswith("(") and out.endswith(",)"):
                     local_path = out[1:-2].strip("'\"")
-                    if os.path.isdir(local_path):
+                    if os.path.exists(local_path):
                         return local_path
         except Exception:
             pass

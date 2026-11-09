@@ -8,8 +8,9 @@ from typing import List, Tuple, Optional
 from PySide6.QtCore import QObject, Signal
 
 from subduck.models import VideoFileInfo, CensorConfig, SubtitleEntry
-from subduck.matcher import calculate_merged_mute_intervals, censor_text_line
+from subduck.matcher import calculate_merged_mute_intervals, censor_text_line, scan_subtitles_for_triggers
 from subduck.sub_parser import serialize_srt
+from subduck.whisper_engine import transcribe_video_to_subtitles, is_whisper_available
 
 LOG_FILE = Path.home() / ".config" / "subduck" / "subduck.log"
 ARTWORK_EXTS = {".jpg", ".jpeg", ".png", ".nfo", ".xml"}
@@ -119,19 +120,66 @@ def copy_artwork_and_metadata(source_dir: Path, target_dir: Path, log_fn=None):
 def process_single_video(
     info: VideoFileInfo,
     config: CensorConfig,
+    progress_callback=None,
     log_callback=None
 ) -> Tuple[bool, str]:
     """
     Process a single video according to the configured output mode.
+    If subtitles are missing or bitmap-only, automatically transcribes via Whisper if enabled.
     """
     def log(msg: str):
         append_log(msg)
         if log_callback:
             log_callback(msg)
 
-    # In season mirror mode, if this file has NO triggers, we simply copy it over as-is!
+    # Automatic Whisper Subtitle Transcription if needed
+    needs_whisper = (
+        config.whisper_mode == "always" or
+        (config.whisper_mode == "if_missing" and not info.has_subtitles)
+    )
+
+    if needs_whisper and is_whisper_available():
+        log(f"Generating subtitles using Whisper AI ({config.whisper_model}) on {info.filename}...")
+        try:
+            whisper_entries, raw_srt = transcribe_video_to_subtitles(
+                info.path,
+                model_size=config.whisper_model,
+                device=config.whisper_device,
+                progress_callback=progress_callback,
+                log_callback=log
+            )
+            info.subtitle_entries = whisper_entries
+            info.has_subtitles = len(whisper_entries) > 0
+            info.whisper_generated = True
+            info.subtitle_source = f"Whisper AI ({config.whisper_model})"
+
+            # Try saving raw generated SRT next to original if configured
+            if config.whisper_save_to_source and raw_srt:
+                try:
+                    src_srt = info.path.parent / f"{info.path.stem}.srt"
+                    if not src_srt.exists():
+                        src_srt.write_text(raw_srt, encoding="utf-8")
+                        log(f"Saved generated subtitle to source folder: {src_srt.name}")
+                except Exception:
+                    pass
+
+            # Scan newly generated subtitles for triggers
+            if config.trigger_words:
+                info.matches = scan_subtitles_for_triggers(whisper_entries, config)
+                if info.matches:
+                    info.status = f"Flagged ({info.trigger_count})"
+                    log(f"Whisper transcription detected {len(info.matches)} trigger instance(s).")
+                else:
+                    info.status = "Clean"
+                    log("Whisper transcription clean: 0 trigger words detected.")
+        except Exception as e:
+            log(f"Whisper AI transcription error: {e}")
+            if not info.has_subtitles:
+                return False, f"Whisper AI transcription failed: {e}"
+
+    # In season mirror mode, if this file has NO triggers, copy unmodified
     if not info.matches and config.output_mode == "season_mirror":
-        out_video_path, _ = build_output_paths(info.path, config)
+        out_video_path, out_sub_path = build_output_paths(info.path, config)
         if not out_video_path.exists() or out_video_path.stat().st_size != info.file_size:
             log(f"Copying clean episode to mirror folder: {info.filename}")
             try:
@@ -142,9 +190,18 @@ def process_single_video(
         else:
             log(f"Clean episode already present in mirror folder: {info.filename}")
 
-        # Always ensure all associated subtitle files are copied to the mirror folder
+        # If Whisper generated subtitles for this clean episode, save them to the mirror folder
+        if info.whisper_generated and info.subtitle_entries and config.whisper_save_srt:
+            try:
+                raw_srt = serialize_srt(info.subtitle_entries)
+                out_sub_path.write_text(raw_srt, encoding="utf-8")
+                log(f"Saved generated subtitle to mirror folder: {out_sub_path.name}")
+            except Exception as e:
+                log(f"Notice saving mirror subtitle: {e}")
+
+        # Ensure all existing associated subtitle files are copied to the mirror folder
         try:
-            has_exact_srt = False
+            has_exact_srt = out_sub_path.exists()
             for s_file in info.path.parent.iterdir():
                 if s_file.is_file() and s_file.name.startswith(info.path.stem) and s_file.suffix.lower() in {".srt", ".vtt"}:
                     dest_sub = out_video_path.parent / s_file.name
@@ -178,7 +235,7 @@ def process_single_video(
     censored_entries, srt_content = create_censored_subtitles(info.subtitle_entries, config)
 
     # Save external .srt file if enabled
-    if config.save_srt:
+    if config.save_srt or config.whisper_save_srt:
         try:
             out_sub_path.write_text(srt_content, encoding="utf-8")
             log(f"Saved external censored subtitle: {out_sub_path.name}")
@@ -309,6 +366,7 @@ class BatchProcessWorker(QObject):
     file_finished = Signal(str, bool, str, int, int)
     all_finished = Signal(int, int, list)
     log_message = Signal(str)
+    whisper_progress = Signal(int, float, float)
 
     def __init__(self, video_items: List[VideoFileInfo], all_scanned_items: List[VideoFileInfo], config: CensorConfig, source_dir: Path):
         super().__init__()
@@ -334,7 +392,6 @@ class BatchProcessWorker(QObject):
             if self.config.copy_artwork:
                 copy_artwork_and_metadata(self.source_dir, mirror_dir, log_fn=lambda m: self.log_message.emit(m))
 
-            # In Season Mirror Mode, we process all items (flagged items get ducked, clean items get copied)
             items_to_process = self.all_scanned_items
         else:
             items_to_process = self.video_items
@@ -349,6 +406,7 @@ class BatchProcessWorker(QObject):
             ok, msg = process_single_video(
                 item,
                 self.config,
+                progress_callback=lambda pct, cur, tot: self.whisper_progress.emit(pct, cur, tot),
                 log_callback=lambda m: self.log_message.emit(m)
             )
 
