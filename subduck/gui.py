@@ -540,18 +540,12 @@ class MainWindow(QMainWindow):
         self.btn_browse = QPushButton("Browse...")
         self.btn_browse.clicked.connect(self.browse_folder)
 
-        self.btn_smb = QPushButton("Enter Path")
-        self.btn_smb.setToolTip("Enter direct folder path, local path, or SMB network URL (e.g. smb://nas.local/media/...)")
-        self.btn_smb.setStyleSheet("font-weight: 500;")
-        self.btn_smb.clicked.connect(self.open_smb_dialog)
-
         self.btn_scan = QPushButton("Scan Folder")
         self.btn_scan.setStyleSheet("font-weight: bold; padding: 6px 14px; background-color: #2980b9; color: white;")
         self.btn_scan.clicked.connect(self.start_scan)
 
         top_layout.addWidget(self.edit_folder)
         top_layout.addWidget(self.btn_browse)
-        top_layout.addWidget(self.btn_smb)
         top_layout.addWidget(self.btn_scan)
         root_layout.addWidget(top_group)
 
@@ -615,7 +609,7 @@ class MainWindow(QMainWindow):
         self.splitter.setHandleWidth(6)
         self.splitter.setStyleSheet("""
             QSplitter::handle {
-                background-color: #bdc3c7;
+                background-color: #2c3e50;
             }
             QSplitter::handle:hover {
                 background-color: #3498db;
@@ -673,11 +667,28 @@ class MainWindow(QMainWindow):
         # Bottom Action Bar
         bottom_layout = QHBoxLayout()
 
-        self.btn_select_flagged = QPushButton("Select All Flagged")
+        self.btn_select_all = QPushButton("Select All")
+        self.btn_select_all.setToolTip("Select all video files in the list")
+        self.btn_select_all.clicked.connect(self.select_all)
+        bottom_layout.addWidget(self.btn_select_all)
+
+        self.btn_select_flagged = QPushButton("Select Flagged")
+        self.btn_select_flagged.setToolTip("Select only files with detected trigger word matches")
         self.btn_select_flagged.clicked.connect(self.select_all_flagged)
         bottom_layout.addWidget(self.btn_select_flagged)
 
+        self.btn_select_no_subs = QPushButton("Without Subtitles")
+        self.btn_select_no_subs.setToolTip("Select files missing text subtitles (including bitmap subtitles), ready for Whisper transcription")
+        self.btn_select_no_subs.clicked.connect(self.select_without_subtitles)
+        bottom_layout.addWidget(self.btn_select_no_subs)
+
+        self.btn_select_with_subs = QPushButton("With Subtitles")
+        self.btn_select_with_subs.setToolTip("Select files that have verified text subtitles")
+        self.btn_select_with_subs.clicked.connect(self.select_with_subtitles)
+        bottom_layout.addWidget(self.btn_select_with_subs)
+
         self.btn_select_none = QPushButton("Clear Selection")
+        self.btn_select_none.setToolTip("Deselect all video files")
         self.btn_select_none.clicked.connect(self.select_none)
         bottom_layout.addWidget(self.btn_select_none)
 
@@ -942,8 +953,9 @@ class MainWindow(QMainWindow):
             trig_item.setText("Clean")
             trig_item.setForeground(QColor("#2ecc71"))
         elif info.has_bitmap_subtitles:
-            trig_item.setText("Ready for Whisper")
-            trig_item.setForeground(QColor("#d35400"))
+            trig_item.setText("Unable to determine")
+            trig_item.setToolTip("Bitmap subtitles (PGS/VobSub) contain image graphics rather than text. Transcribe with Whisper to detect trigger words.")
+            trig_item.setForeground(QColor("#7f8c8d"))
         else:
             trig_item.setText("-")
             trig_item.setForeground(QColor("#95a5a6"))
@@ -1011,6 +1023,12 @@ class MainWindow(QMainWindow):
                 prev_item = QTableWidgetItem(prev_text)
                 self.insp_table.setItem(i_row, 2, prev_item)
 
+    def select_all(self):
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item:
+                item.setCheckState(Qt.Checked)
+
     def select_all_flagged(self):
         for row in range(self.table.rowCount()):
             if row < len(self.video_items):
@@ -1018,6 +1036,22 @@ class MainWindow(QMainWindow):
                 item = self.table.item(row, 0)
                 if item:
                     item.setCheckState(Qt.Checked if has_matches else Qt.Unchecked)
+
+    def select_without_subtitles(self):
+        for row in range(self.table.rowCount()):
+            if row < len(self.video_items):
+                no_subs = not self.video_items[row].has_subtitles
+                item = self.table.item(row, 0)
+                if item:
+                    item.setCheckState(Qt.Checked if no_subs else Qt.Unchecked)
+
+    def select_with_subtitles(self):
+        for row in range(self.table.rowCount()):
+            if row < len(self.video_items):
+                with_subs = self.video_items[row].has_subtitles
+                item = self.table.item(row, 0)
+                if item:
+                    item.setCheckState(Qt.Checked if with_subs else Qt.Unchecked)
 
     def select_none(self):
         for row in range(self.table.rowCount()):
