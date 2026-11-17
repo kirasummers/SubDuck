@@ -468,12 +468,13 @@ class BatchProcessWorker(QObject):
     copy_progress = Signal(str, int, int, int)
     status_update = Signal(str)
 
-    def __init__(self, video_items: List[VideoFileInfo], all_scanned_items: List[VideoFileInfo], config: CensorConfig, source_dir: Path):
+    def __init__(self, video_items: List[VideoFileInfo], all_scanned_items: List[VideoFileInfo], config: CensorConfig, source_dir: Path, process_all: bool = False):
         super().__init__()
         self.video_items = video_items
         self.all_scanned_items = all_scanned_items
         self.config = config
         self.source_dir = source_dir
+        self.process_all = process_all
         self._is_cancelled = False
         self._active_proc = None
 
@@ -490,19 +491,19 @@ class BatchProcessWorker(QObject):
         fail_count = 0
         error_list = []
 
-        # If Season Mirror Mode, ensure the mirror destination exists and copy artwork first
+        # If Folder / Season Mirror Mode, ensure the mirror destination exists and copy artwork first
         if self.config.output_mode == "season_mirror":
-            self.status_update.emit("Setting up Season Mirror directory...")
+            self.status_update.emit("Setting up Folder Mirror directory...")
             mirror_dir = Path(self.config.season_mirror_folder) if self.config.season_mirror_folder else get_default_season_mirror_dir(self.source_dir)
             mirror_dir.mkdir(parents=True, exist_ok=True)
-            self.log_message.emit(f"Season Mirror Directory: {mirror_dir}")
-            if self.config.copy_artwork:
+            self.log_message.emit(f"Folder Mirror Directory: {mirror_dir}")
+            if self.config.copy_artwork and self.process_all:
                 self.status_update.emit("Copying posters, artwork, and metadata...")
                 copy_artwork_and_metadata(self.source_dir, mirror_dir, log_fn=lambda m: self.log_message.emit(m))
 
-            items_to_process = self.all_scanned_items
+            items_to_process = self.all_scanned_items if self.process_all else self.video_items
         else:
-            items_to_process = self.video_items
+            items_to_process = self.all_scanned_items if self.process_all else self.video_items
 
         total_items = len(items_to_process)
         for idx, item in enumerate(items_to_process, 1):

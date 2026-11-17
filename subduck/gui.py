@@ -268,8 +268,8 @@ class SettingsDialog(QDialog):
 
         self.btn_group_mode = QButtonGroup(self)
 
-        self.rb_season = QRadioButton("Mirror Complete Season to New Folder (Recommended for TV Shows & Jellyfin)")
-        self.rb_season.setToolTip("Creates a clean season folder with standard episode names, ducking flagged episodes and copying clean ones so Jellyfin autoplay works flawlessly.")
+        self.rb_season = QRadioButton("Mirror Complete Folder / Season to New Directory (Jellyfin Autoplay Ready)")
+        self.rb_season.setToolTip("Creates a clean mirror folder with standard filenames, ducking flagged videos and copying clean ones so media players and Jellyfin work flawlessly.")
         self.btn_group_mode.addButton(self.rb_season, 0)
         mode_layout.addWidget(self.rb_season)
 
@@ -286,9 +286,9 @@ class SettingsDialog(QDialog):
         self.btn_mirror_browse.clicked.connect(self.browse_mirror)
         dest_h.addWidget(self.edit_mirror_dir)
         dest_h.addWidget(self.btn_mirror_browse)
-        season_form.addRow("Season Target Folder:", dest_h)
+        season_form.addRow("Target Mirror Folder:", dest_h)
 
-        self.chk_copy_clean = QCheckBox("Copy clean episodes automatically (ensures complete season)")
+        self.chk_copy_clean = QCheckBox("Copy clean videos automatically (ensures complete folder / season)")
         self.chk_copy_clean.setChecked(self.config.copy_clean_files)
         season_form.addRow(self.chk_copy_clean)
 
@@ -570,7 +570,7 @@ class MainWindow(QMainWindow):
         trig_row1.addSpacing(15)
         trig_row1.addWidget(QLabel("Output Mode:"))
         self.combo_mode = QComboBox()
-        self.combo_mode.addItem("Season Mirror (Jellyfin Autoplay Ready)", "season_mirror")
+        self.combo_mode.addItem("Complete Folder Mirror (Jellyfin Autoplay Ready)", "season_mirror")
         self.combo_mode.addItem("In-Place Replace (with backup)", "inplace_replace")
         self.combo_mode.addItem("Dual-Audio Track in Single File", "dual_audio")
         self.combo_mode.addItem("Save Alongside with Suffix", "separate_suffix")
@@ -700,10 +700,19 @@ class MainWindow(QMainWindow):
 
         bottom_layout.addStretch()
 
-        self.btn_process = QPushButton("Process Complete Season")
-        self.btn_process.setStyleSheet("background-color: #27ae60; color: white; font-weight: bold; padding: 7px 18px;")
-        self.btn_process.clicked.connect(self.start_batch_process)
-        bottom_layout.addWidget(self.btn_process)
+        self.btn_process_selected = QPushButton("Process Selected")
+        self.btn_process_selected.setToolTip("Process only the checked/selected video files")
+        self.btn_process_selected.setStyleSheet("background-color: #2980b9; color: white; font-weight: bold; padding: 7px 16px;")
+        self.btn_process_selected.clicked.connect(lambda: self.start_batch_process(process_all=False))
+        bottom_layout.addWidget(self.btn_process_selected)
+
+        self.btn_process_folder = QPushButton("Process Complete Folder")
+        self.btn_process_folder.setToolTip("Process all videos in this folder (in Mirror Mode: censors flagged videos and copies clean videos + artwork for complete playback)")
+        self.btn_process_folder.setStyleSheet("background-color: #27ae60; color: white; font-weight: bold; padding: 7px 16px;")
+        self.btn_process_folder.clicked.connect(lambda: self.start_batch_process(process_all=True))
+        bottom_layout.addWidget(self.btn_process_folder)
+
+        # Alias for backward compatibility
 
         self.btn_stop = QPushButton("Stop Processing")
         self.btn_stop.setStyleSheet("background-color: #c0392b; color: white; font-weight: bold; padding: 7px 18px;")
@@ -731,17 +740,25 @@ class MainWindow(QMainWindow):
         mode = self.combo_mode.currentData()
         self.config.output_mode = mode
         if mode == "season_mirror":
-            self.btn_process.setText("Process Complete Season")
-            self.btn_process.setStyleSheet("background-color: #27ae60; color: white; font-weight: bold; padding: 7px 18px;")
+            self.btn_process_selected.setText("Process Selected (Mirror)")
+            self.btn_process_selected.setToolTip("Process only the checked/selected videos into the mirror folder")
+            self.btn_process_folder.setText("Process Complete Folder")
+            self.btn_process_folder.setToolTip("Process all videos in this folder (censors flagged videos and copies clean ones to mirror folder for complete playback)")
         elif mode == "inplace_replace":
-            self.btn_process.setText("Replace In-Place (Selected)")
-            self.btn_process.setStyleSheet("background-color: #d35400; color: white; font-weight: bold; padding: 7px 18px;")
+            self.btn_process_selected.setText("▶ Replace Selected In-Place")
+            self.btn_process_selected.setToolTip("In-place replace only the checked/selected videos")
+            self.btn_process_folder.setText("Replace All in Folder")
+            self.btn_process_folder.setToolTip("In-place replace all videos in this folder")
         elif mode == "dual_audio":
-            self.btn_process.setText("Create Dual-Audio Files")
-            self.btn_process.setStyleSheet("background-color: #8e44ad; color: white; font-weight: bold; padding: 7px 18px;")
+            self.btn_process_selected.setText("▶ Create Dual-Audio (Selected)")
+            self.btn_process_selected.setToolTip("Create dual-audio files for only the checked/selected videos")
+            self.btn_process_folder.setText("Create Dual-Audio for All")
+            self.btn_process_folder.setToolTip("Create dual-audio files for all videos in this folder")
         else:
-            self.btn_process.setText("Process Selected Videos")
-            self.btn_process.setStyleSheet("background-color: #2980b9; color: white; font-weight: bold; padding: 7px 18px;")
+            self.btn_process_selected.setText("Process Selected Videos")
+            self.btn_process_selected.setToolTip("Process only the checked/selected videos with filename suffix")
+            self.btn_process_folder.setText("Process All in Folder")
+            self.btn_process_folder.setToolTip("Process all videos in this folder with filename suffix")
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls() or event.mimeData().hasText():
@@ -1077,36 +1094,61 @@ class MainWindow(QMainWindow):
         if self.transcribe_worker:
             self.transcribe_worker.cancel()
 
-    def start_batch_process(self):
+    def start_batch_process(self, process_all: bool = False):
+        if not self.video_items:
+            QMessageBox.information(self, "No Videos Loaded", "Please scan or select a folder containing video files first.")
+            return
+
         selected_items = []
         for row in range(self.table.rowCount()):
             item = self.table.item(row, 0)
             if item and item.checkState() == Qt.Checked and row < len(self.video_items):
                 selected_items.append(self.video_items[row])
 
-        if self.config.output_mode == "season_mirror":
-            # In season mode, we process all items in the season
+        if process_all:
             count = len(self.video_items)
-            msg = (
-                f"Season Mirror Mode will process all {count} episode(s) in this season:\n\n"
-                f"• Flagged episodes ({len(selected_items)}) will be ducked/censored with standard clean names.\n"
-                f"• Clean episodes will be copied directly to ensure the season is 100% complete.\n"
-                f"• Artwork and posters will be copied over for Jellyfin.\n\n"
-                f"Proceed?"
-            )
+            flagged_in_all = sum(1 for v in self.video_items if v.matches)
+            if self.config.output_mode == "season_mirror":
+                msg = (
+                    f"Complete Folder Mirror Mode will process all {count} video(s) in this folder:\n\n"
+                    f"• Flagged videos ({flagged_in_all}) will be ducked/censored with standard clean names.\n"
+                    f"• Clean videos will be copied directly to ensure the folder is 100% complete for autoplay.\n"
+                    f"• Artwork and posters will be copied over for Jellyfin.\n\n"
+                    f"Proceed?"
+                )
+            else:
+                msg = f"Ready to process all {count} video(s) in this folder using '{self.config.output_mode}' mode?\n\nProceed?"
         else:
             if not selected_items:
-                QMessageBox.information(self, "No Videos Selected", "Please select at least one video to process.")
-                return
+                rows = self.table.selectionModel().selectedRows()
+                if rows and rows[0].row() < len(self.video_items):
+                    selected_items = [self.video_items[rows[0].row()]]
+                else:
+                    QMessageBox.information(
+                        self,
+                        "No Videos Selected",
+                        "Please check the checkbox next to at least one video to process, or use 'Select Flagged' / 'Select All'."
+                    )
+                    return
             count = len(selected_items)
-            msg = f"Ready to process {count} video(s) using '{self.config.output_mode}' mode?"
+            if self.config.output_mode == "season_mirror":
+                msg = (
+                    f"Ready to process {count} selected video(s) into the mirror folder?\n\n"
+                    f"• Only the {count} selected video(s) will be processed/copied.\n"
+                    f"• Unselected videos will not be copied.\n\n"
+                    f"Proceed?"
+                )
+            else:
+                msg = f"Ready to process {count} selected video(s) using '{self.config.output_mode}' mode?\n\nProceed?"
 
         confirm = QMessageBox.question(self, "Confirm Processing", msg, QMessageBox.Yes | QMessageBox.No)
         if confirm != QMessageBox.Yes:
             return
 
-        self.btn_process.setVisible(False)
-        self.btn_process.setEnabled(False)
+        self.btn_process_selected.setVisible(False)
+        self.btn_process_selected.setEnabled(False)
+        self.btn_process_folder.setVisible(False)
+        self.btn_process_folder.setEnabled(False)
         self.btn_transcribe.setEnabled(False)
         self.btn_scan.setEnabled(False)
         self.btn_stop.setEnabled(True)
@@ -1130,7 +1172,8 @@ class MainWindow(QMainWindow):
             video_items=selected_items,
             all_scanned_items=self.video_items,
             config=self.config,
-            source_dir=src_dir
+            source_dir=src_dir,
+            process_all=process_all
         )
         self.process_worker.moveToThread(self.process_thread)
 
@@ -1225,8 +1268,10 @@ class MainWindow(QMainWindow):
             return
 
         self.btn_transcribe.setEnabled(False)
-        self.btn_process.setVisible(False)
-        self.btn_process.setEnabled(False)
+        self.btn_process_selected.setVisible(False)
+        self.btn_process_selected.setEnabled(False)
+        self.btn_process_folder.setVisible(False)
+        self.btn_process_folder.setEnabled(False)
         self.btn_scan.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.btn_stop.setVisible(True)
@@ -1304,8 +1349,10 @@ class MainWindow(QMainWindow):
         self.btn_transcribe.setEnabled(True)
         self.btn_stop.setVisible(False)
         self.btn_stop.setEnabled(False)
-        self.btn_process.setVisible(True)
-        self.btn_process.setEnabled(True)
+        self.btn_process_selected.setVisible(True)
+        self.btn_process_selected.setEnabled(True)
+        self.btn_process_folder.setVisible(True)
+        self.btn_process_folder.setEnabled(True)
         self.btn_scan.setEnabled(True)
         self.btn_stop.setText("Stop Processing")
         self.progress_bar.setVisible(False)
@@ -1362,8 +1409,10 @@ class MainWindow(QMainWindow):
         self.process_thread.wait()
         self.btn_stop.setVisible(False)
         self.btn_stop.setEnabled(False)
-        self.btn_process.setVisible(True)
-        self.btn_process.setEnabled(True)
+        self.btn_process_selected.setVisible(True)
+        self.btn_process_selected.setEnabled(True)
+        self.btn_process_folder.setVisible(True)
+        self.btn_process_folder.setEnabled(True)
         self.btn_transcribe.setEnabled(True)
         self.btn_scan.setEnabled(True)
         self.btn_stop.setText("Stop Processing")
@@ -1388,10 +1437,10 @@ class MainWindow(QMainWindow):
                 )
                 QMessageBox.information(
                     self,
-                    "Season Mirror Complete",
-                    f"Complete Season Mirror is ready!\n\n"
-                    f"• All {success_count} episodes processed/copied\n"
-                    f"• Clean standard episode filenames for Jellyfin autoplay\n"
+                    "Folder Mirror Complete",
+                    f"Folder mirror processing complete!\n\n"
+                    f"• {success_count} video(s) processed/copied\n"
+                    f"• Clean standard filenames for Jellyfin autoplay\n"
                     f"• Artwork and posters preserved\n\n"
                     f"Location: {dest}"
                 )
