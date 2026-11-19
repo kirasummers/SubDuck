@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+
 
 @dataclass
 class SubtitleEntry:
@@ -9,6 +9,7 @@ class SubtitleEntry:
     end_sec: float
     text: str
     original_block: str = ""
+    word_timings: list[tuple[str, float, float]] = field(default_factory=list)
 
     @property
     def start_str(self) -> str:
@@ -22,11 +23,13 @@ class SubtitleEntry:
     def duration(self) -> float:
         return max(0.0, self.end_sec - self.start_sec)
 
+
 @dataclass
 class TriggerMatch:
     entry: SubtitleEntry
-    matched_words: List[str]
+    matched_words: list[str]
     censored_text: str
+
 
 @dataclass
 class VideoFileInfo:
@@ -40,10 +43,10 @@ class VideoFileInfo:
     has_bitmap_subtitles: bool = False
     bitmap_codec: str = ""
     whisper_generated: bool = False
-    subtitle_entries: List[SubtitleEntry] = field(default_factory=list)
-    matches: List[TriggerMatch] = field(default_factory=list)
-    status: str = "Unscanned"  # Unscanned, Clean, Flagged, No Subtitles, Bitmap Subs, Done, Error
-    output_path: Optional[Path] = None
+    subtitle_entries: list[SubtitleEntry] = field(default_factory=list)
+    matches: list[TriggerMatch] = field(default_factory=list)
+    status: str = "Unscanned"
+    output_path: Path | None = None
     error_msg: str = ""
 
     @property
@@ -56,7 +59,7 @@ class VideoFileInfo:
             return "--:--"
         m, s = divmod(int(self.duration_sec), 60)
         h, m = divmod(m, 60)
-        if h > 0:
+        if h:
             return f"{h:02d}:{m:02d}:{s:02d}"
         return f"{m:02d}:{s:02d}"
 
@@ -65,27 +68,23 @@ class VideoFileInfo:
         if self.file_size <= 0:
             return "0 B"
         size = float(self.file_size)
-        for unit in ["B", "KB", "MB", "GB", "TB"]:
+        for unit in ("B", "KB", "MB", "GB", "TB"):
             if size < 1024.0:
                 return f"{size:.1f} {unit}"
             size /= 1024.0
         return f"{size:.1f} PB"
 
+
 @dataclass
 class CensorConfig:
-    trigger_words: List[str] = field(default_factory=list)
+    trigger_words: list[str] = field(default_factory=list)
     safety_before_ms: int = 200
     safety_after_ms: int = 200
-    ducking_mode: str = "mute"  # mute, duck_20db, custom
-    ducking_level: float = 0.0  # 0 = silence, 0.1 = -20dB
-    censor_style: str = "asterisks"  # asterisks, inner_asterisks, tag, block, remove
-    strict_matching: bool = True  # True = whole word boundary respecting hyphens
+    ducking_mode: str = "mute"
+    ducking_level: float = 0.0
+    censor_style: str = "asterisks"
+    strict_matching: bool = True
 
-    # Output Modes:
-    # "season_mirror": Complete Season Mirror to new folder (clean filenames, copies clean episodes + artwork)
-    # "inplace_replace": Overwrite original in place (with optional backup)
-    # "dual_audio": Add second ducked track as default, keep original audio
-    # "separate_suffix": Save alongside as <Name> trigger.<ext>
     output_mode: str = "season_mirror"
     season_mirror_folder: str = ""
     backup_originals: bool = True
@@ -97,18 +96,16 @@ class CensorConfig:
     embed_sub: bool = True
     subtitle_lang: str = "eng"
 
-    # AI Whisper Subtitle Generation Settings
-    whisper_mode: str = "if_missing"  # "if_missing", "always", "disabled"
-    whisper_model: str = "base.en"     # "tiny.en", "base.en", "small.en", "medium.en", "large-v3"
-    whisper_device: str = "auto"       # "auto", "cuda", "cpu"
-    whisper_save_srt: bool = True      # Save .srt to output folder
-    whisper_save_to_source: bool = True # Save .srt next to source video if writable
+    whisper_mode: str = "if_missing"
+    whisper_model: str = "base.en"
+    whisper_device: str = "auto"
+    whisper_save_srt: bool = True
+    whisper_save_to_source: bool = True
 
-    # System Power Management
-    inhibit_sleep: bool = True         # Prevent OS/display sleep while processing
+    inhibit_sleep: bool = True
+
 
 def sec_to_srt_time(sec: float) -> str:
-    """Format seconds into SRT timestamp HH:MM:SS,mmm."""
     if sec < 0:
         sec = 0.0
     millis = int(round((sec - int(sec)) * 1000))
@@ -118,21 +115,13 @@ def sec_to_srt_time(sec: float) -> str:
     total_sec = int(sec)
     s = total_sec % 60
     total_min = total_sec // 60
-    m = total_min % 60
-    h = total_min // 60
-    return f"{h:02d}:{m:02d}:{s:02d},{millis:03d}"
+    return f"{total_min // 60:02d}:{total_min % 60:02d}:{s:02d},{millis:03d}"
+
 
 def srt_time_to_sec(time_str: str) -> float:
-    """Parse SRT timestamp HH:MM:SS,mmm or HH:MM:SS.mmm into float seconds."""
-    time_str = time_str.strip().replace(",", ".")
-    parts = time_str.split(":")
+    parts = time_str.strip().replace(",", ".").split(":")
     if len(parts) == 3:
-        h = float(parts[0])
-        m = float(parts[1])
-        s = float(parts[2])
-        return h * 3600.0 + m * 60.0 + s
-    elif len(parts) == 2:
-        m = float(parts[0])
-        s = float(parts[1])
-        return m * 60.0 + s
+        return float(parts[0]) * 3600.0 + float(parts[1]) * 60.0 + float(parts[2])
+    if len(parts) == 2:
+        return float(parts[0]) * 60.0 + float(parts[1])
     return float(time_str)

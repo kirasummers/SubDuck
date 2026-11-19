@@ -1,29 +1,78 @@
-"""Sleep and idle inhibitor for keeping the system awake during processing."""
-import os
-import signal
+import ctypes
+import shutil
 import subprocess
-from typing import Optional
+import sys
+
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+ES_DISPLAY_REQUIRED = 0x00000002
+
+
+def _dbus_inhibit(dest: str, obj_path: str, method: str, reason: str) -> int | None:
+    if not shutil.which("gdbus"):
+        return None
+    cmd = [
+        "gdbus", "call", "--session",
+        "--dest", dest,
+        "--object-path", obj_path,
+        "--method", method,
+        "SubDuck", reason
+    ]
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=3)
+    if res.returncode == 0 and res.stdout.strip():
+        tokens = res.stdout.strip().strip("(),").replace(",", " ").split()
+        for tok in reversed(tokens):
+            if tok.isdigit():
+                return int(tok)
+    return None
+
+
+def _dbus_uninhibit(dest: str, obj_path: str, method: str, cookie: int):
+    if not shutil.which("gdbus"):
+        return
+    cmd = [
+        "gdbus", "call", "--session",
+        "--dest", dest,
+        "--object-path", obj_path,
+        "--method", method,
+        str(cookie)
+    ]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+
 
 class SleepInhibitor:
-    """Inhibits system sleep, suspend, and screensaver during long operations."""
-
     def __init__(self):
-        self._proc: Optional[subprocess.Popen] = None
-        self._pm_cookie: Optional[int] = None
-        self._ss_cookie: Optional[int] = None
-        self._is_active: bool = False
+        self._proc = None
+        self._pm_cookie = None
+        self._ss_cookie = None
+        self._is_active = False
 
     @property
     def is_active(self) -> bool:
         return self._is_active
 
-    def acquire(self, reason: str = "Processing videos and audio in SubDuck") -> bool:
-        """Acquire sleep and idle inhibition lock."""
+    def acquire(self, reason: str = "Processing videos in SubDuck") -> bool:
         if self._is_active:
             return True
 
-        # systemd-inhibit process
-        try:
+        if sys.platform == "win32":
+            k32 = getattr(ctypes.windll, "kernel32", None)
+            if k32:
+                k32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
+            self._is_active = True
+            return True
+
+        if sys.platform == "darwin":
+            if shutil.which("caffeinate"):
+                self._proc = subprocess.Popen(
+                    ["caffeinate", "-di"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+            self._is_active = True
+            return True
+
+        if shutil.which("systemd-inhibit"):
             self._proc = subprocess.Popen(
                 [
                     "systemd-inhibit",
@@ -35,97 +84,58 @@ class SleepInhibitor:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )
-        except Exception:
-            self._proc = None
 
-        # FreeDesktop PowerManagement DBus
-        try:
-            cmd = [
-                "gdbus", "call", "--session",
-                "--dest", "org.freedesktop.PowerManagement.Inhibit",
-                "--object-path", "/org/freedesktop/PowerManagement/Inhibit",
-                "--method", "org.freedesktop.PowerManagement.Inhibit.Inhibit",
-                "SubDuck", reason
-            ]
-            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=3)
-            if p.returncode == 0 and p.stdout.strip():
-                out = p.stdout.strip()
-                tokens = out.replace("(", "").replace(")", "").replace(",", "").split()
-                if len(tokens) >= 2 and tokens[1].isdigit():
-                    self._pm_cookie = int(tokens[1])
-                elif tokens and tokens[0].isdigit():
-                    self._pm_cookie = int(tokens[0])
-        except Exception:
-            self._pm_cookie = None
-
-        # FreeDesktop ScreenSaver DBus
-        try:
-            cmd = [
-                "gdbus", "call", "--session",
-                "--dest", "org.freedesktop.ScreenSaver",
-                "--object-path", "/org/freedesktop/ScreenSaver",
-                "--method", "org.freedesktop.ScreenSaver.Inhibit",
-                "SubDuck", reason
-            ]
-            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=3)
-            if p.returncode == 0 and p.stdout.strip():
-                out = p.stdout.strip()
-                tokens = out.replace("(", "").replace(")", "").replace(",", "").split()
-                if len(tokens) >= 2 and tokens[1].isdigit():
-                    self._ss_cookie = int(tokens[1])
-                elif tokens and tokens[0].isdigit():
-                    self._ss_cookie = int(tokens[0])
-        except Exception:
-            self._ss_cookie = None
+        self._pm_cookie = _dbus_inhibit(
+            "org.freedesktop.PowerManagement.Inhibit",
+            "/org/freedesktop/PowerManagement/Inhibit",
+            "org.freedesktop.PowerManagement.Inhibit.Inhibit",
+            reason
+        )
+        self._ss_cookie = _dbus_inhibit(
+            "org.freedesktop.ScreenSaver",
+            "/org/freedesktop/ScreenSaver",
+            "org.freedesktop.ScreenSaver.Inhibit",
+            reason
+        )
 
         self._is_active = True
         return True
 
     def release(self):
-        """Release all active sleep and idle locks."""
         if not self._is_active:
             return
 
-        # Terminate systemd-inhibit
-        if self._proc:
+        if sys.platform == "win32":
+            k32 = getattr(ctypes.windll, "kernel32", None)
+            if k32:
+                k32.SetThreadExecutionState(ES_CONTINUOUS)
+            self._is_active = False
+            return
+
+        if self._proc is not None:
+            self._proc.terminate()
             try:
-                self._proc.terminate()
                 self._proc.wait(timeout=2)
-            except Exception:
-                try:
-                    self._proc.kill()
-                except Exception:
-                    pass
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
             self._proc = None
 
-        # Release PowerManagement cookie
         if self._pm_cookie is not None:
-            try:
-                cmd = [
-                    "gdbus", "call", "--session",
-                    "--dest", "org.freedesktop.PowerManagement.Inhibit",
-                    "--object-path", "/org/freedesktop/PowerManagement/Inhibit",
-                    "--method", "org.freedesktop.PowerManagement.Inhibit.UnInhibit",
-                    str(self._pm_cookie)
-                ]
-                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
-            except Exception:
-                pass
+            _dbus_uninhibit(
+                "org.freedesktop.PowerManagement.Inhibit",
+                "/org/freedesktop/PowerManagement/Inhibit",
+                "org.freedesktop.PowerManagement.Inhibit.UnInhibit",
+                self._pm_cookie
+            )
             self._pm_cookie = None
 
-        # Release ScreenSaver cookie
         if self._ss_cookie is not None:
-            try:
-                cmd = [
-                    "gdbus", "call", "--session",
-                    "--dest", "org.freedesktop.ScreenSaver",
-                    "--object-path", "/org/freedesktop/ScreenSaver",
-                    "--method", "org.freedesktop.ScreenSaver.UnInhibit",
-                    str(self._ss_cookie)
-                ]
-                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
-            except Exception:
-                pass
+            _dbus_uninhibit(
+                "org.freedesktop.ScreenSaver",
+                "/org/freedesktop/ScreenSaver",
+                "org.freedesktop.ScreenSaver.UnInhibit",
+                self._ss_cookie
+            )
             self._ss_cookie = None
 
         self._is_active = False

@@ -1,35 +1,25 @@
 import os
+import shutil
 import subprocess
-from typing import List, Optional
+
 
 def ensure_kio_fuse_running() -> bool:
-    """Ensure systemd user service kio-fuse is active."""
-    try:
-        subprocess.run(
-            ["systemctl", "--user", "start", "kio-fuse.service"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=5
-        )
-        return True
-    except Exception:
+    if not shutil.which("systemctl"):
         return False
+    res = subprocess.run(
+        ["systemctl", "--user", "start", "kio-fuse.service"],
+        capture_output=True,
+        timeout=5
+    )
+    return res.returncode == 0
+
 
 def resolve_network_url(url_or_path: str) -> str:
-    """
-    If given an smb://, sftp://, or other KIO URL, mount it via kio-fuse
-    and return the real local POSIX path.
-    """
     clean_str = url_or_path.strip().strip("'\"")
-    if not clean_str:
+    if not clean_str or os.path.exists(clean_str):
         return clean_str
 
-    # If it is already a valid local POSIX path, return it as-is
-    if os.path.exists(clean_str):
-        return clean_str
-
-    # Check if it is a KIO network URL
-    if clean_str.startswith(("smb://", "sftp://", "fish://", "ftp://", "nfs://")):
+    if clean_str.startswith(("smb://", "sftp://", "fish://", "ftp://", "nfs://")) and shutil.which("gdbus"):
         ensure_kio_fuse_running()
         cmd = [
             "gdbus", "call", "--session",
@@ -38,32 +28,26 @@ def resolve_network_url(url_or_path: str) -> str:
             "--method", "org.kde.KIOFuse.VFS.mountUrl",
             clean_str
         ]
-        try:
-            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=12)
-            if p.returncode == 0:
-                out = p.stdout.strip()
-                # Parse gdbus response: ('/run/user/1000/kio-fuse-.../smb/...',)
-                if out.startswith("('") and out.endswith("',)"):
-                    local_path = out[2:-3]
-                    if os.path.exists(local_path):
-                        return local_path
-                elif out.startswith("(") and out.endswith(",)"):
-                    local_path = out[1:-2].strip("'\"")
-                    if os.path.exists(local_path):
-                        return local_path
-        except Exception:
-            pass
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+        if res.returncode == 0:
+            out = res.stdout.strip()
+            if out.startswith("(") and out.endswith(",)"):
+                local_path = out[1:-2].strip("'\"")
+                if os.path.exists(local_path):
+                    return local_path
 
     return clean_str
 
-def get_kio_fuse_smb_root() -> Optional[str]:
-    """Find the active kio-fuse SMB root directory if available."""
-    uid = os.getuid()
-    base = f"/run/user/{uid}"
-    if os.path.isdir(base):
-        for entry in os.listdir(base):
-            if entry.startswith("kio-fuse"):
-                smb_dir = os.path.join(base, entry, "smb")
-                if os.path.isdir(smb_dir):
-                    return smb_dir
+
+def get_kio_fuse_smb_root() -> str | None:
+    if not hasattr(os, "getuid"):
+        return None
+    base = f"/run/user/{os.getuid()}"
+    if not os.path.isdir(base):
+        return None
+    for entry in os.listdir(base):
+        if entry.startswith("kio-fuse"):
+            smb_dir = os.path.join(base, entry, "smb")
+            if os.path.isdir(smb_dir):
+                return smb_dir
     return None

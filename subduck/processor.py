@@ -1,10 +1,8 @@
-import os
 import re
 import shutil
-import tempfile
 import subprocess
+import tempfile
 from pathlib import Path
-from typing import List, Tuple, Optional
 from PySide6.QtCore import QObject, Signal
 
 from subduck.models import VideoFileInfo, CensorConfig, SubtitleEntry
@@ -15,21 +13,23 @@ from subduck.whisper_engine import transcribe_video_to_subtitles, is_whisper_ava
 LOG_FILE = Path.home() / ".config" / "subduck" / "subduck.log"
 ARTWORK_EXTS = {".jpg", ".jpeg", ".png", ".nfo", ".xml"}
 
+
 def append_log(msg: str):
-    try:
-        LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(msg + "\n")
-    except Exception:
-        pass
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(msg + "\n")
+
+
+def _cleanup_partial_file(path: Path, only_if_empty: bool = False):
+    if not path.exists():
+        return
+    if only_if_empty and path.stat().st_size > 0:
+        return
+    path.unlink(missing_ok=True)
+
 
 def get_default_season_mirror_dir(source_dir: Path) -> Path:
-    """
-    Generate default mirror folder name:
-    If source is a season directory (e.g. '.../Series Name/Season 1'):
-      Returns '.../Series Name [Trigger-Clean]/Season 1'
-    This prevents Jellyfin from grouping original and clean episodes into the same season.
-    """
+    # Keep parallel show folder at top level so Jellyfin doesn't merge seasons
     folder_name = source_dir.name
     if re.search(r"^(season|series|s)\s*\d+", folder_name, re.I):
         show_dir = source_dir.parent
@@ -38,40 +38,44 @@ def get_default_season_mirror_dir(source_dir: Path) -> Path:
             return lib_dir / f"{show_dir.name} [Trigger-Clean]" / folder_name
     return source_dir.parent / f"{folder_name} [Trigger-Clean]"
 
-def build_output_paths(video_path: Path, config: CensorConfig) -> Tuple[Path, Path]:
-    """Calculate the destination path for the video and subtitle files based on output mode."""
+
+def build_output_paths(video_path: Path, config: CensorConfig) -> tuple[Path, Path]:
     mode = config.output_mode
 
     if mode == "season_mirror":
-        dest_dir = Path(config.season_mirror_folder) if config.season_mirror_folder else get_default_season_mirror_dir(video_path.parent)
+        dest_dir = (
+            Path(config.season_mirror_folder)
+            if config.season_mirror_folder
+            else get_default_season_mirror_dir(video_path.parent)
+        )
         dest_dir.mkdir(parents=True, exist_ok=True)
-        # Inside the mirror folder, keep clean original filenames for seamless Jellyfin autoplay
         return dest_dir / video_path.name, dest_dir / f"{video_path.stem}.srt"
 
-    elif mode == "inplace_replace":
-        # Temporary output file before in-place replace
+    if mode == "inplace_replace":
         temp_out = video_path.parent / f".tmp_{video_path.stem}{video_path.suffix}"
         return temp_out, video_path.parent / f"{video_path.stem}.srt"
 
-    elif mode == "dual_audio":
+    if mode == "dual_audio":
         suffix = config.output_suffix or " dual"
         dest_dir = video_path.parent
-        return dest_dir / f"{video_path.stem}{suffix}{video_path.suffix}", dest_dir / f"{video_path.stem}{suffix}.srt"
+        return (
+            dest_dir / f"{video_path.stem}{suffix}{video_path.suffix}",
+            dest_dir / f"{video_path.stem}{suffix}.srt"
+        )
 
-    else:  # separate_suffix
-        dest_dir = video_path.parent
-        if config.output_folder:
-            p = Path(config.output_folder)
-            if p.is_dir():
-                dest_dir = p
-        suffix = config.output_suffix or " trigger"
-        return dest_dir / f"{video_path.stem}{suffix}{video_path.suffix}", dest_dir / f"{video_path.stem}{suffix}.srt"
+    dest_dir = video_path.parent
+    if config.output_folder:
+        p = Path(config.output_folder)
+        if p.is_dir():
+            dest_dir = p
+    suffix = config.output_suffix or " trigger"
+    return (
+        dest_dir / f"{video_path.stem}{suffix}{video_path.suffix}",
+        dest_dir / f"{video_path.stem}{suffix}.srt"
+    )
 
-def create_censored_subtitles(
-    entries: List[SubtitleEntry],
-    config: CensorConfig
-) -> Tuple[List[SubtitleEntry], str]:
-    """Generate modified subtitle entries with trigger words censored."""
+
+def create_censored_subtitles(entries: list[SubtitleEntry], config: CensorConfig):
     censored_entries = []
     for entry in entries:
         censored_text, _ = censor_text_line(
@@ -84,33 +88,31 @@ def create_censored_subtitles(
             index=entry.index,
             start_sec=entry.start_sec,
             end_sec=entry.end_sec,
-            text=censored_text
+            text=censored_text,
+            word_timings=list(entry.word_timings)
         ))
-    srt_str = serialize_srt(censored_entries)
-    return censored_entries, srt_str
+    return censored_entries, serialize_srt(censored_entries)
 
-def get_container_subtitle_codec(ext: str) -> Optional[str]:
-    """Determine the compatible subtitle codec for the target container format."""
+
+def get_container_subtitle_codec(ext: str) -> str | None:
     ext_clean = ext.lower().strip()
-    if ext_clean in [".mp4", ".m4v", ".mov"]:
+    if ext_clean in {".mp4", ".m4v", ".mov"}:
         return "mov_text"
-    elif ext_clean in [".mkv"]:
+    if ext_clean == ".mkv":
         return "srt"
-    elif ext_clean in [".webm"]:
+    if ext_clean == ".webm":
         return "webvtt"
     return None
 
-def safe_copy_file(src: Path, dst: Path, progress_callback=None, cancel_check=None, chunk_size: int = 4 * 1024 * 1024):
-    """
-    Safely copy a file, working around FUSE/SMB limitations where
-    copystat (e.g. utime, xattrs) raises Errno 25 (Inappropriate ioctl for device).
-    If progress_callback is provided, calls progress_callback(copied_bytes, total_bytes).
-    If cancel_check is provided and returns True, terminates copy and removes partial file.
-    """
-    try:
-        total_size = src.stat().st_size
-    except Exception:
-        total_size = 0
+
+def safe_copy_file(
+    src: Path,
+    dst: Path,
+    progress_callback=None,
+    cancel_check=None,
+    chunk_size: int = 4 * 1024 * 1024
+) -> bool:
+    total_size = src.stat().st_size if src.exists() else 0
 
     if not progress_callback and not cancel_check:
         shutil.copyfile(src, dst)
@@ -121,11 +123,7 @@ def safe_copy_file(src: Path, dst: Path, progress_callback=None, cancel_check=No
             while True:
                 if cancel_check and cancel_check():
                     fdst.close()
-                    if dst.exists():
-                        try:
-                            dst.unlink()
-                        except Exception:
-                            pass
+                    _cleanup_partial_file(dst)
                     return False
                 chunk = fsrc.read(chunk_size)
                 if not chunk:
@@ -141,41 +139,37 @@ def safe_copy_file(src: Path, dst: Path, progress_callback=None, cancel_check=No
         if progress_callback:
             progress_callback(copied, total_size)
 
+    # copystat throws ENOTTY (errno 25) on kio-fuse smb mounts
     try:
         shutil.copystat(src, dst)
     except OSError:
         pass
     return True
 
+
 def copy_artwork_and_metadata(source_dir: Path, target_dir: Path, log_fn=None):
-    """Copy thumbnails, posters, and NFO metadata to target directory."""
     if not source_dir.is_dir() or not target_dir.is_dir():
         return
-    try:
-        # If this is a season directory, also copy show-level artwork to show-level mirror directory
-        if re.search(r"^(season|series|s)\s*\d+", source_dir.name, re.I):
-            show_src = source_dir.parent
-            show_dest = target_dir.parent
-            if show_src.is_dir() and show_dest.is_dir():
-                for item in show_src.iterdir():
-                    if item.is_file() and item.suffix.lower() in ARTWORK_EXTS:
-                        dest = show_dest / item.name
-                        if not dest.exists():
-                            safe_copy_file(item, dest)
-                            if log_fn:
-                                log_fn(f"Copied series artwork: {item.name}")
+    if re.search(r"^(season|series|s)\s*\d+", source_dir.name, re.I):
+        show_src = source_dir.parent
+        show_dest = target_dir.parent
+        if show_src.is_dir() and show_dest.is_dir():
+            for item in show_src.iterdir():
+                if item.is_file() and item.suffix.lower() in ARTWORK_EXTS:
+                    dest = show_dest / item.name
+                    if not dest.exists():
+                        safe_copy_file(item, dest)
+                        if log_fn:
+                            log_fn(f"Copied series artwork: {item.name}")
 
-        # Copy current directory artwork (season posters, fanart, etc.)
-        for item in source_dir.iterdir():
-            if item.is_file() and item.suffix.lower() in ARTWORK_EXTS:
-                dest = target_dir / item.name
-                if not dest.exists():
-                    safe_copy_file(item, dest)
-                    if log_fn:
-                        log_fn(f"Copied artwork: {item.name}")
-    except Exception as e:
-        if log_fn:
-            log_fn(f"Artwork copy notice: {e}")
+    for item in source_dir.iterdir():
+        if item.is_file() and item.suffix.lower() in ARTWORK_EXTS:
+            dest = target_dir / item.name
+            if not dest.exists():
+                safe_copy_file(item, dest)
+                if log_fn:
+                    log_fn(f"Copied artwork: {item.name}")
+
 
 def process_single_video(
     info: VideoFileInfo,
@@ -185,24 +179,19 @@ def process_single_video(
     cancel_check=None,
     worker=None,
     log_callback=None
-) -> Tuple[bool, str]:
-    """
-    Process a single video according to the configured output mode.
-    If subtitles are missing or bitmap-only, automatically transcribes via Whisper if enabled.
-    """
+) -> tuple[bool, str]:
     def log(msg: str):
         append_log(msg)
         if log_callback:
             log_callback(msg)
 
-    # Automatic Whisper Subtitle Transcription if needed
     needs_whisper = (
-        config.whisper_mode == "always" or
-        (config.whisper_mode == "if_missing" and not info.has_subtitles)
+        config.whisper_mode == "always"
+        or (config.whisper_mode == "if_missing" and not info.has_subtitles)
     )
 
     if needs_whisper and is_whisper_available():
-        log(f"Generating subtitles using Whisper AI ({config.whisper_model}) on {info.filename}...")
+        log(f"Generating subtitles using Whisper ({config.whisper_model}) on {info.filename}...")
         try:
             whisper_entries, raw_srt = transcribe_video_to_subtitles(
                 info.path,
@@ -218,19 +207,14 @@ def process_single_video(
             info.subtitle_entries = whisper_entries
             info.has_subtitles = len(whisper_entries) > 0
             info.whisper_generated = True
-            info.subtitle_source = f"Whisper AI ({config.whisper_model})"
+            info.subtitle_source = f"Whisper ({config.whisper_model})"
 
-            # Try saving raw generated SRT next to original if configured
             if config.whisper_save_to_source and raw_srt:
-                try:
-                    src_srt = info.path.parent / f"{info.path.stem}.srt"
-                    if not src_srt.exists():
-                        src_srt.write_text(raw_srt, encoding="utf-8")
-                        log(f"Saved generated subtitle to source folder: {src_srt.name}")
-                except Exception:
-                    pass
+                src_srt = info.path.parent / f"{info.path.stem}.srt"
+                if not src_srt.exists():
+                    src_srt.write_text(raw_srt, encoding="utf-8")
+                    log(f"Saved generated subtitle to source folder: {src_srt.name}")
 
-            # Scan newly generated subtitles for triggers
             if config.trigger_words:
                 info.matches = scan_subtitles_for_triggers(whisper_entries, config)
                 if info.matches:
@@ -239,60 +223,52 @@ def process_single_video(
                 else:
                     info.status = "Clean"
                     log("Whisper transcription clean: 0 trigger words detected.")
-        except Exception as e:
-            log(f"Whisper AI transcription error: {e}")
+        except RuntimeError as e:
+            log(f"Whisper transcription error: {e}")
             if not info.has_subtitles:
-                return False, f"Whisper AI transcription failed: {e}"
+                return False, f"Whisper transcription failed: {e}"
 
-    # In season mirror mode, if this file has NO triggers, copy unmodified
     if not info.matches and config.output_mode == "season_mirror":
         out_video_path, out_sub_path = build_output_paths(info.path, config)
         if not out_video_path.exists() or out_video_path.stat().st_size != info.file_size:
             log(f"Copying clean episode to mirror folder: {info.filename}")
-            try:
-                def on_copy_chunk(fname, copied, total):
-                    if copy_progress_callback:
-                        copy_progress_callback(fname, copied, total)
 
-                ok_copy = safe_copy_file(info.path, out_video_path, progress_callback=lambda c, t: on_copy_chunk(info.filename, c, t), cancel_check=cancel_check)
-                if not ok_copy or (cancel_check and cancel_check()):
-                    return False, "Cancelled by user"
-            except Exception as e:
-                log(f"Error copying clean episode: {e}")
-                return False, str(e)
+            def on_copy_chunk(fname, copied, total):
+                if copy_progress_callback:
+                    copy_progress_callback(fname, copied, total)
+
+            ok_copy = safe_copy_file(
+                info.path,
+                out_video_path,
+                progress_callback=lambda c, t: on_copy_chunk(info.filename, c, t),
+                cancel_check=cancel_check
+            )
+            if not ok_copy or (cancel_check and cancel_check()):
+                return False, "Cancelled by user"
         else:
             log(f"Clean episode already present in mirror folder: {info.filename}")
 
-        # If Whisper generated subtitles for this clean episode, save them to the mirror folder
         if info.whisper_generated and info.subtitle_entries and config.whisper_save_srt:
-            try:
-                raw_srt = serialize_srt(info.subtitle_entries)
-                out_sub_path.write_text(raw_srt, encoding="utf-8")
-                log(f"Saved generated subtitle to mirror folder: {out_sub_path.name}")
-            except Exception as e:
-                log(f"Notice saving mirror subtitle: {e}")
+            raw_srt = serialize_srt(info.subtitle_entries)
+            out_sub_path.write_text(raw_srt, encoding="utf-8")
+            log(f"Saved generated subtitle to mirror folder: {out_sub_path.name}")
 
-        # Ensure all existing associated subtitle files are copied to the mirror folder
-        try:
-            has_exact_srt = out_sub_path.exists()
-            for s_file in info.path.parent.iterdir():
-                if s_file.is_file() and s_file.name.startswith(info.path.stem) and s_file.suffix.lower() in {".srt", ".vtt"}:
-                    dest_sub = out_video_path.parent / s_file.name
-                    if not dest_sub.exists():
-                        safe_copy_file(s_file, dest_sub)
-                        log(f"Copied subtitle: {s_file.name}")
-                    if s_file.name == f"{out_video_path.stem}.srt":
-                        has_exact_srt = True
+        has_exact_srt = out_sub_path.exists()
+        for s_file in info.path.parent.iterdir():
+            if s_file.is_file() and s_file.name.startswith(info.path.stem) and s_file.suffix.lower() in {".srt", ".vtt"}:
+                dest_sub = out_video_path.parent / s_file.name
+                if not dest_sub.exists():
+                    safe_copy_file(s_file, dest_sub)
+                    log(f"Copied subtitle: {s_file.name}")
+                if s_file.name == f"{out_video_path.stem}.srt":
+                    has_exact_srt = True
 
-            # If an English subtitle exists (e.g. .en.srt) but no exact .srt, copy as .srt for default player recognition
-            if not has_exact_srt:
-                en_sub = info.path.parent / f"{info.path.stem}.en.srt"
-                std_sub = out_video_path.parent / f"{out_video_path.stem}.srt"
-                if en_sub.is_file() and not std_sub.exists():
-                    safe_copy_file(en_sub, std_sub)
-                    log(f"Normalized English subtitle for player compatibility: {std_sub.name}")
-        except Exception as e:
-            log(f"Subtitle copy notice: {e}")
+        if not has_exact_srt:
+            en_sub = info.path.parent / f"{info.path.stem}.en.srt"
+            std_sub = out_video_path.parent / f"{out_video_path.stem}.srt"
+            if en_sub.is_file() and not std_sub.exists():
+                safe_copy_file(en_sub, std_sub)
+                log(f"Normalized English subtitle for player compatibility: {std_sub.name}")
 
         info.output_path = out_video_path
         return True, "Clean episode copied to season mirror."
@@ -304,22 +280,17 @@ def process_single_video(
     out_video_path, out_sub_path = build_output_paths(info.path, config)
     log(f"Processing: {info.filename} -> {out_video_path.name}")
 
-    # Generate censored subtitle
-    censored_entries, srt_content = create_censored_subtitles(info.subtitle_entries, config)
+    _, srt_content = create_censored_subtitles(info.subtitle_entries, config)
 
-    # Save external .srt file if enabled
     if config.save_srt or config.whisper_save_srt:
-        try:
-            out_sub_path.write_text(srt_content, encoding="utf-8")
-            log(f"Saved external censored subtitle: {out_sub_path.name}")
-        except Exception as e:
-            log(f"Warning: Failed to write external subtitle: {e}")
+        out_sub_path.write_text(srt_content, encoding="utf-8")
+        log(f"Saved external censored subtitle: {out_sub_path.name}")
 
-    # Calculate audio mute intervals
     merged_intervals = calculate_merged_mute_intervals(
         info.matches,
         config.safety_before_ms,
-        config.safety_after_ms
+        config.safety_after_ms,
+        strict=config.strict_matching
     )
     log(f"Calculated {len(merged_intervals)} audio mute interval(s).")
 
@@ -336,19 +307,20 @@ def process_single_video(
             tf.write(srt_content)
             temp_srt = tf.name
 
-        def build_cmd(embed_sub: bool) -> List[str]:
+        def build_cmd(embed_sub: bool) -> list[str]:
             cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-y", "-i", str(info.path)]
             if embed_sub and temp_srt:
                 cmd.extend(["-i", temp_srt])
 
             if config.output_mode == "dual_audio":
-                # Dual Audio: Track 1 = Original, Track 2 = Ducked (Default)
                 cmd.extend([
                     "-filter_complex", f"[0:a:0]{af_filter}[aduck]",
                     "-c:v", "copy",
                     "-map", "0:v:0",
-                    "-map", "0:a:0", "-c:a:0", "copy", "-metadata:s:a:0", "title=Original Audio", "-disposition:a:0", "0",
-                    "-map", "[aduck]", "-c:a:1", "aac", "-b:a", "256k", "-metadata:s:a:1", "title=Trigger-Muted", "-disposition:a:1", "default"
+                    "-map", "0:a:0", "-c:a:0", "copy",
+                    "-metadata:s:a:0", "title=Original Audio", "-disposition:a:0", "0",
+                    "-map", "[aduck]", "-c:a:1", "aac", "-b:a", "256k",
+                    "-metadata:s:a:1", "title=Trigger-Muted", "-disposition:a:1", "default"
                 ])
                 if embed_sub and temp_srt:
                     cmd.extend([
@@ -356,9 +328,7 @@ def process_single_video(
                         "-metadata:s:s:0", "title=Censored English", "-disposition:s:0", "default"
                     ])
             else:
-                # Standard Ducked Audio Output
-                cmd.extend(["-c:v", "copy"])
-                cmd.extend(["-af", af_filter, "-c:a", "aac", "-b:a", "256k"])
+                cmd.extend(["-c:v", "copy", "-af", af_filter, "-c:a", "aac", "-b:a", "256k"])
                 if embed_sub and temp_srt:
                     cmd.extend([
                         "-map", "0:v:0",
@@ -374,7 +344,7 @@ def process_single_video(
             cmd.extend(["-map_chapters", "0", "-map_metadata", "0", str(out_video_path)])
             return cmd
 
-        def run_proc(command: List[str]):
+        def run_proc(command: list[str]):
             p = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             if worker:
                 worker._active_proc = p
@@ -383,49 +353,29 @@ def process_single_video(
                 worker._active_proc = None
             return p.returncode, stdout, stderr
 
-        # Try with embedded subtitles
         cmd = build_cmd(can_embed)
         log(f"Running FFmpeg: {' '.join(cmd)}")
-        rc, out, err = run_proc(cmd)
+        rc, _, err = run_proc(cmd)
 
         if cancel_check and cancel_check():
-            if out_video_path.exists():
-                try:
-                    out_video_path.unlink()
-                except Exception:
-                    pass
+            _cleanup_partial_file(out_video_path)
             return False, "Cancelled by user"
 
-        # Fallback without subtitle embedding if container rejected codec
         if rc != 0 and can_embed:
             log(f"Embedding subtitle rejected by container ({err[-150:].strip()}). Retrying without embedding...")
-            if out_video_path.exists() and out_video_path.stat().st_size == 0:
-                try:
-                    out_video_path.unlink()
-                except Exception:
-                    pass
-            cmd_fallback = build_cmd(False)
-            rc, out, err = run_proc(cmd_fallback)
+            _cleanup_partial_file(out_video_path, only_if_empty=True)
+            rc, _, err = run_proc(build_cmd(False))
 
             if cancel_check and cancel_check():
-                if out_video_path.exists():
-                    try:
-                        out_video_path.unlink()
-                    except Exception:
-                        pass
+                _cleanup_partial_file(out_video_path)
                 return False, "Cancelled by user"
 
         if rc != 0:
             err_tail = err[-400:].strip()
             log(f"FFmpeg error:\n{err_tail}")
-            if out_video_path.exists() and out_video_path.stat().st_size == 0:
-                try:
-                    out_video_path.unlink()
-                except Exception:
-                    pass
+            _cleanup_partial_file(out_video_path, only_if_empty=True)
             return False, f"FFmpeg failed: {err_tail.splitlines()[-1] if err_tail else 'Unknown error'}"
 
-        # Handle in-place replacement backup
         if config.output_mode == "inplace_replace":
             final_target = info.path
             if config.backup_originals:
@@ -435,29 +385,19 @@ def process_single_video(
                 shutil.move(info.path, backup_file)
                 log(f"Backed up original to: {backup_file}")
             else:
-                info.path.unlink()
+                info.path.unlink(missing_ok=True)
             shutil.move(out_video_path, final_target)
             info.output_path = final_target
         else:
             info.output_path = out_video_path
 
-        log(f"SUCCESS: Completed {info.filename}")
+        log(f"Completed {info.filename}")
         return True, "Success"
 
-    except Exception as e:
-        log(f"Exception during processing: {e}")
-        if out_video_path.exists() and out_video_path.stat().st_size == 0:
-            try:
-                out_video_path.unlink()
-            except Exception:
-                pass
-        return False, str(e)
     finally:
-        if temp_srt and os.path.exists(temp_srt):
-            try:
-                os.remove(temp_srt)
-            except Exception:
-                pass
+        if temp_srt:
+            Path(temp_srt).unlink(missing_ok=True)
+
 
 class BatchProcessWorker(QObject):
     file_started = Signal(str, int, int)
@@ -468,7 +408,7 @@ class BatchProcessWorker(QObject):
     copy_progress = Signal(str, int, int, int)
     status_update = Signal(str)
 
-    def __init__(self, video_items: List[VideoFileInfo], all_scanned_items: List[VideoFileInfo], config: CensorConfig, source_dir: Path, process_all: bool = False):
+    def __init__(self, video_items, all_scanned_items, config: CensorConfig, source_dir: Path, process_all: bool = False):
         super().__init__()
         self.video_items = video_items
         self.all_scanned_items = all_scanned_items
@@ -480,32 +420,30 @@ class BatchProcessWorker(QObject):
 
     def cancel(self):
         self._is_cancelled = True
-        if self._active_proc:
-            try:
-                self._active_proc.terminate()
-            except Exception:
-                pass
+        if self._active_proc is not None:
+            self._active_proc.terminate()
 
     def run(self):
         success_count = 0
         fail_count = 0
         error_list = []
 
-        # If Folder / Season Mirror Mode, ensure the mirror destination exists and copy artwork first
         if self.config.output_mode == "season_mirror":
-            self.status_update.emit("Setting up Folder Mirror directory...")
-            mirror_dir = Path(self.config.season_mirror_folder) if self.config.season_mirror_folder else get_default_season_mirror_dir(self.source_dir)
+            self.status_update.emit("Preparing mirror directory...")
+            mirror_dir = (
+                Path(self.config.season_mirror_folder)
+                if self.config.season_mirror_folder
+                else get_default_season_mirror_dir(self.source_dir)
+            )
             mirror_dir.mkdir(parents=True, exist_ok=True)
-            self.log_message.emit(f"Folder Mirror Directory: {mirror_dir}")
+            self.log_message.emit(f"Mirror directory: {mirror_dir}")
             if self.config.copy_artwork and self.process_all:
                 self.status_update.emit("Copying posters, artwork, and metadata...")
-                copy_artwork_and_metadata(self.source_dir, mirror_dir, log_fn=lambda m: self.log_message.emit(m))
+                copy_artwork_and_metadata(self.source_dir, mirror_dir, log_fn=self.log_message.emit)
 
-            items_to_process = self.all_scanned_items if self.process_all else self.video_items
-        else:
-            items_to_process = self.all_scanned_items if self.process_all else self.video_items
-
+        items_to_process = self.all_scanned_items if self.process_all else self.video_items
         total_items = len(items_to_process)
+
         for idx, item in enumerate(items_to_process, 1):
             if self._is_cancelled:
                 self.log_message.emit("Batch processing cancelled by user.")
@@ -520,11 +458,11 @@ class BatchProcessWorker(QObject):
             ok, msg = process_single_video(
                 item,
                 self.config,
-                progress_callback=lambda pct, cur, tot: self.whisper_progress.emit(pct, cur, tot),
+                progress_callback=self.whisper_progress.emit,
                 copy_progress_callback=on_copy,
                 cancel_check=lambda: self._is_cancelled,
                 worker=self,
-                log_callback=lambda m: self.log_message.emit(m)
+                log_callback=self.log_message.emit
             )
 
             if ok:

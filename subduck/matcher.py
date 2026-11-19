@@ -1,118 +1,111 @@
 import re
-from typing import List, Tuple
 from subduck.models import SubtitleEntry, TriggerMatch, CensorConfig
 
+
 def build_word_regex(word: str, strict: bool = True) -> re.Pattern:
-    """
-    Build a regex pattern for a trigger word.
-    Strict mode enforces boundaries around alphanumeric characters,
-    allowing hyphens, apostrophes, and punctuation (e.g. 'cancer' matches 'cancer-sign').
-    """
-    clean_word = word.strip()
-    escaped = re.escape(clean_word)
+    escaped = re.escape(word.strip())
     if strict:
         return re.compile(rf"(?i)(?<![A-Za-z0-9]){escaped}(?![A-Za-z0-9])")
-    else:
-        return re.compile(rf"(?i){escaped}")
+    return re.compile(rf"(?i){escaped}")
+
 
 def censor_word_token(word: str, style: str) -> str:
-    """Format the replacement string for a detected trigger word."""
-    length = len(word)
-    if style == "asterisks":
-        return "*" * length
-    elif style == "inner_asterisks":
-        if length <= 2:
-            return "*" * length
-        return word[0] + ("*" * (length - 2)) + word[-1]
-    elif style == "tag":
+    n = len(word)
+    if style == "inner_asterisks":
+        return "*" * n if n <= 2 else word[0] + ("*" * (n - 2)) + word[-1]
+    if style == "tag":
         return "[censored]"
-    elif style == "block":
-        return "█" * length
-    elif style == "remove":
+    if style == "block":
+        return "█" * n
+    if style == "remove":
         return ""
-    return "*" * length
+    return "*" * n
 
-def censor_text_line(text: str, trigger_words: List[str], style: str, strict: bool) -> Tuple[str, List[str]]:
-    """
-    Censor all occurrences of trigger words in a text line.
-    Returns the censored string and a list of matched words.
-    """
+
+def censor_text_line(text: str, trigger_words: list[str], style: str, strict: bool):
     matched = []
     result = text
 
-    for w in trigger_words:
-        w = w.strip()
+    for raw_word in trigger_words:
+        w = raw_word.strip()
         if not w:
             continue
-        pattern = build_word_regex(w, strict)
-        found = pattern.findall(result)
-        if found:
-            matched.extend(found)
-            result = pattern.sub(lambda m: censor_word_token(m.group(0), style), result)
+        pat = build_word_regex(w, strict)
+        hits = pat.findall(result)
+        if hits:
+            matched.extend(hits)
+            result = pat.sub(lambda m: censor_word_token(m.group(0), style), result)
 
-    # Clean up double spaces if words were removed
     if style == "remove":
         result = re.sub(r"\s+", " ", result).strip()
 
     return result, matched
 
-def scan_subtitles_for_triggers(
-    entries: List[SubtitleEntry],
-    config: CensorConfig
-) -> List[TriggerMatch]:
-    """Scan all subtitle entries against the config's trigger words."""
-    matches = []
-    if not config.trigger_words:
-        return matches
 
+def scan_subtitles_for_triggers(entries: list[SubtitleEntry], config: CensorConfig) -> list[TriggerMatch]:
+    if not config.trigger_words:
+        return []
+
+    matches = []
     for entry in entries:
-        censored_text, matched_words = censor_text_line(
+        censored_text, hits = censor_text_line(
             entry.text,
             config.trigger_words,
             config.censor_style,
             config.strict_matching
         )
-        if matched_words:
+        if hits:
+            seen = set()
+            deduped = []
+            for h in hits:
+                if h not in seen:
+                    seen.add(h)
+                    deduped.append(h)
             matches.append(TriggerMatch(
                 entry=entry,
-                matched_words=list(set(matched_words)),
+                matched_words=deduped,
                 censored_text=censored_text
             ))
 
     return matches
 
+
 def calculate_merged_mute_intervals(
-    matches: List[TriggerMatch],
+    matches: list[TriggerMatch],
     safety_before_ms: int = 200,
-    safety_after_ms: int = 200
-) -> List[Tuple[float, float]]:
-    """
-    Calculate and merge audio mute time windows (in seconds).
-    Adds lead-in and lead-out safety buffers and merges overlapping windows.
-    """
+    safety_after_ms: int = 200,
+    strict: bool = True
+) -> list[tuple[float, float]]:
     if not matches:
         return []
 
-    pad_before = max(0.0, safety_before_ms / 1000.0)
-    pad_after = max(0.0, safety_after_ms / 1000.0)
+    pad_in = max(0.0, safety_before_ms / 1000.0)
+    pad_out = max(0.0, safety_after_ms / 1000.0)
 
-    # Create raw interval windows
-    raw_intervals = []
+    windows = []
     for m in matches:
-        start = max(0.0, m.entry.start_sec - pad_before)
-        end = m.entry.end_sec + pad_after
-        raw_intervals.append((start, end))
+        word_hits = []
+        if m.entry.word_timings:
+            has_phrase = any(" " in mw.strip() for mw in m.matched_words)
+            if not has_phrase:
+                pats = [build_word_regex(mw, strict=strict) for mw in m.matched_words]
+                for tok, w_start, w_end in m.entry.word_timings:
+                    if any(p.search(tok) for p in pats):
+                        word_hits.append((max(0.0, w_start - pad_in), w_end + pad_out))
 
-    # Sort by start time
-    raw_intervals.sort(key=lambda x: x[0])
-
-    # Merge overlapping or contiguous intervals
-    merged = [raw_intervals[0]]
-    for cur_start, cur_end in raw_intervals[1:]:
-        prev_start, prev_end = merged[-1]
-        if cur_start <= prev_end + 0.05:  # within 50ms is joined
-            merged[-1] = (prev_start, max(prev_end, cur_end))
+        if word_hits:
+            windows.extend(word_hits)
         else:
-            merged.append((cur_start, cur_end))
+            windows.append((max(0.0, m.entry.start_sec - pad_in), m.entry.end_sec + pad_out))
+
+    windows.sort(key=lambda x: x[0])
+
+    merged = [windows[0]]
+    for cur_s, cur_e in windows[1:]:
+        prev_s, prev_e = merged[-1]
+        if cur_s <= prev_e + 0.05:
+            merged[-1] = (prev_s, max(prev_e, cur_e))
+        else:
+            merged.append((cur_s, cur_e))
 
     return merged

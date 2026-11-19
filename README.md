@@ -1,44 +1,43 @@
-# SubDuck - Video Trigger Word & Audio Ducking Studio
+# SubDuck
 
-SubDuck is a desktop application built with Python and PySide6 (Qt6) that scans video collections for sensitive trigger words in subtitles, ducks/mutes the audio during those exact timestamps, censors the subtitle text, and creates clean copies of your media files.
+PySide6 desktop tool for scanning video files against custom trigger word lists, muting or ducking the audio around matched dialogue, and redacting the subtitle track without re-encoding the video stream (`-c:v copy`).
 
----
+If a video doesn't have text subtitles (or only has Blu-ray PGS / DVD VobSub bitmap subtitles), SubDuck can extract a temporary 16 kHz mono WAV and transcribe it locally with `faster-whisper`.
 
-## 4 Output & Library Integration Modes
+## Requirements
 
-1. **Season Mirror Mode (Recommended for TV Shows & Jellyfin)**:
-   - Creates a mirror directory (e.g. `Season 1 [Trigger-Clean]`).
-   - Every file inside uses its **standard clean filename** (no ` trigger` suffix), ensuring Jellyfin autoplay and episode ordering work without interruptions.
-   - Episodes with triggers are processed with ducked audio and censored subtitles.
-   - Clean episodes (0 triggers) are automatically copied over so the season is 100% complete.
-   - Thumbnails, artwork, and NFO metadata are copied over automatically.
+- Python 3.10+
+- `ffmpeg` and `ffprobe` in `PATH` (`sudo pacman -S ffmpeg` or `sudo apt install ffmpeg`)
+- Optional: NVIDIA GPU with CUDA 12 libraries for `faster-whisper` (`float16`). If `nvidia-cublas-cu12` and `nvidia-cudnn-cu12` are installed inside `.venv`, SubDuck preloads the `.so` files at startup so you don't need to export `LD_LIBRARY_PATH` manually.
 
-2. **In-Place Replacement (Saves Disk Space)**:
-   - Replaces the original video file in-place with the ducked/censored version.
-   - Includes a safety option to back up the original video to an `_originals/` subfolder.
+## Setup
 
-3. **Dual-Audio Track in Single File**:
-   - Embeds both the Original Audio (Track 1) and the Trigger-Muted Audio (Track 2) into the same file.
-   - Sets the ducked track as the `default` playback track and embeds the censored subtitle track.
+```bash
+git clone https://github.com/kirasummers/SubDuck.git
+cd SubDuck
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+```
 
-4. **Save Alongside with Suffix (Best for Single Movies)**:
-   - Saves `<Name> trigger.<ext>` and `<Name> trigger.srt` alongside the original file.
+Run with `subduck` or `python3 main.py`.
 
----
+## How it works
 
-## Key Features
+1. Point the app at a local folder or drag a folder in from Dolphin (`smb://` and `sftp://` URLs are mounted automatically via `kio-fuse` on KDE).
+2. Pick a trigger profile or edit the word list via **Edit Trigger Words...** (words stay hidden on the main window unless revealed).
+3. Choose an output mode:
+   - **Complete Folder Mirror**: writes a parallel folder (`<Series> [Trigger-Clean]/Season X`) with original filenames so Jellyfin/Plex don't merge filtered and unfiltered episodes into one entry. Clean episodes, posters, and `.nfo` files are copied across.
+   - **In-Place Replace**: moves the original file into `_originals/` and writes the filtered file in place.
+   - **Dual-Audio Track**: keeps the original audio track alongside the filtered track (set as default) in the same container.
+   - **Save Alongside with Suffix**: outputs `<Name> trigger.<ext>` next to the source video.
 
-- **Intelligent Subtitle Extraction**: Automatically reads external `.srt`/`.vtt` files or extracts embedded English tracks from `.mkv` and `.mp4` containers.
-- **Hyphen-Aware Whole-Word Matching**: Matches whole words strictly without false positives (e.g. `ass` will never match `class` or `passive`), while allowing hyphenated words (e.g. `cancer` matches `cancer-sign`).
-- **Lossless Fast Video Passthrough**: Uses stream copy (`-c:v copy`) for video, avoiding re-encoding degradation and finishing an episode in seconds.
-- **KDE & SMB Network Integration**: Native support for network shares via `kio-fuse`. Paste `smb://...` URLs directly, click **SMB / Network...**, or drag and drop folders from Dolphin.
-- **Audio Safety Buffers**: Customizable lead-in and lead-out buffers (default: 200 ms).
-- **Trigger Presets**: Save and load custom profiles (Medical & Illness, Profanity, Violence, Phobias).
+## Tests
 
----
+```bash
+pytest
+```
 
-## How to Launch
+## License
 
-- **Terminal**: `subduck`
-- **Application Launcher**: Search for **SubDuck** in your KDE Kickoff menu.
-- **Direct Script**: `python3 main.py`
+MIT

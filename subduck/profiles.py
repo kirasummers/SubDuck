@@ -1,15 +1,16 @@
-import os
 import json
 from pathlib import Path
-from typing import Dict, Any, List
 from subduck.models import CensorConfig
 
 CONFIG_DIR = Path.home() / ".config" / "subduck"
 PROFILES_FILE = CONFIG_DIR / "profiles.json"
 
-DEFAULT_PROFILES: Dict[str, Dict[str, Any]] = {
+DEFAULT_PROFILES = {
     "Medical & Illness Triggers": {
-        "trigger_words": ["cancer", "tumor", "chemo", "chemotherapy", "stroke", "seizure", "hemorrhage", "overdose", "terminal"],
+        "trigger_words": [
+            "cancer", "tumor", "chemo", "chemotherapy", "stroke",
+            "seizure", "hemorrhage", "overdose", "terminal"
+        ],
         "safety_before_ms": 200,
         "safety_after_ms": 200,
         "ducking_mode": "mute",
@@ -19,7 +20,10 @@ DEFAULT_PROFILES: Dict[str, Dict[str, Any]] = {
         "output_suffix": " trigger"
     },
     "Profanity & Swearing": {
-        "trigger_words": ["ass", "asshole", "bastard", "bitch", "crap", "cunt", "damn", "dick", "fuck", "fucking", "motherfucker", "shit"],
+        "trigger_words": [
+            "ass", "asshole", "bastard", "bitch", "crap", "cunt",
+            "damn", "dick", "fuck", "fucking", "motherfucker", "shit"
+        ],
         "safety_before_ms": 150,
         "safety_after_ms": 150,
         "ducking_mode": "mute",
@@ -29,7 +33,10 @@ DEFAULT_PROFILES: Dict[str, Dict[str, Any]] = {
         "output_suffix": " clean"
     },
     "Violence & Graphic Harm": {
-        "trigger_words": ["blood", "bloody", "gore", "decapitate", "stab", "stabbing", "mutilate", "torture", "murder", "corpse"],
+        "trigger_words": [
+            "blood", "bloody", "gore", "decapitate", "stab",
+            "stabbing", "mutilate", "torture", "murder", "corpse"
+        ],
         "safety_before_ms": 250,
         "safety_after_ms": 250,
         "ducking_mode": "duck_20db",
@@ -39,7 +46,10 @@ DEFAULT_PROFILES: Dict[str, Dict[str, Any]] = {
         "output_suffix": " trigger"
     },
     "Phobias (Spiders & Snakes)": {
-        "trigger_words": ["spider", "spiders", "tarantula", "arachnid", "snake", "snakes", "viper", "cobra", "rattlesnake"],
+        "trigger_words": [
+            "spider", "spiders", "tarantula", "arachnid", "snake",
+            "snakes", "viper", "cobra", "rattlesnake"
+        ],
         "safety_before_ms": 200,
         "safety_after_ms": 200,
         "ducking_mode": "mute",
@@ -50,25 +60,20 @@ DEFAULT_PROFILES: Dict[str, Dict[str, Any]] = {
     }
 }
 
-def ensure_config_dir():
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
-def load_all_profiles() -> Dict[str, Dict[str, Any]]:
-    """Load user profiles merged with built-in presets."""
-    ensure_config_dir()
+def load_all_profiles() -> dict:
+    PROFILES_FILE.parent.mkdir(parents=True, exist_ok=True)
     profiles = dict(DEFAULT_PROFILES)
     if PROFILES_FILE.is_file():
-        try:
-            with open(PROFILES_FILE, "r", encoding="utf-8") as f:
-                user_profiles = json.load(f)
-                profiles.update(user_profiles)
-        except Exception:
-            pass
+        raw = PROFILES_FILE.read_text(encoding="utf-8")
+        if raw.strip():
+            user_data = json.loads(raw)
+            if isinstance(user_data, dict):
+                profiles.update(user_data)
     return profiles
 
+
 def save_user_profile(name: str, config: CensorConfig) -> bool:
-    """Save or update a named profile."""
-    ensure_config_dir()
     profiles = load_all_profiles()
     profiles[name] = {
         "trigger_words": config.trigger_words,
@@ -80,23 +85,14 @@ def save_user_profile(name: str, config: CensorConfig) -> bool:
         "strict_matching": config.strict_matching,
         "output_suffix": config.output_suffix
     }
-    try:
-        with open(PROFILES_FILE, "w", encoding="utf-8") as f:
-            json.dump(profiles, f, indent=2, ensure_ascii=False)
-        return True
-    except Exception:
-        return False
+    PROFILES_FILE.write_text(json.dumps(profiles, indent=2, ensure_ascii=False), encoding="utf-8")
+    return True
+
 
 def delete_user_profile(name: str) -> bool:
-    """Delete a profile from storage."""
-    ensure_config_dir()
     profiles = load_all_profiles()
-    if name in profiles:
-        del profiles[name]
-        try:
-            with open(PROFILES_FILE, "w", encoding="utf-8") as f:
-                json.dump(profiles, f, indent=2, ensure_ascii=False)
-            return True
-        except Exception:
-            return False
-    return False
+    if name not in profiles:
+        return False
+    del profiles[name]
+    PROFILES_FILE.write_text(json.dumps(profiles, indent=2, ensure_ascii=False), encoding="utf-8")
+    return True
