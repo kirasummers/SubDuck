@@ -2,11 +2,15 @@
 
 PySide6 desktop tool for scanning video files against custom trigger word lists, muting or ducking the audio around matched dialogue, and redacting the subtitle track without re-encoding the video stream (`-c:v copy`).
 
-![SubDuck Interface](docs/screenshot.png)
+<p align="center">
+  <img src="docs/screenshot.png" alt="SubDuck Interface">
+</p>
 
 If a video doesn't have text subtitles (or only has Blu-ray PGS / DVD VobSub bitmap subtitles), SubDuck can extract a temporary 16 kHz mono WAV and transcribe it locally with `faster-whisper`. Matched trigger words are cleanly muted or ducked in the audio stream and redacted from the subtitle track:
 
-![SubDuck Subtitle Redaction](docs/subtitles.png)
+<p align="center">
+  <img src="docs/subtitles.png" alt="SubDuck Subtitle Redaction">
+</p>
 
 ## Requirements
 
@@ -40,7 +44,9 @@ Run with `subduck` or `python3 main.py`.
 
 Fine-tune safety buffers, ducking volume, Whisper models, and hardware acceleration in the **Settings** dialog:
 
-![SubDuck Settings](docs/settings.png)
+<p align="center">
+  <img src="docs/settings.png" alt="SubDuck Settings">
+</p>
 
 ## Tests
 
