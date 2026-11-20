@@ -36,6 +36,12 @@ Run with `subduck` or `python3 main.py`.
    - **Dual-Audio Track**: keeps the original audio track alongside the filtered track (set as default) in the same container.
    - **Save Alongside with Suffix**: outputs `<Name> trigger.<ext>` next to the source video.
 
+## Settings & Configuration
+
+Fine-tune safety buffers, ducking volume, Whisper models, and hardware acceleration in the **Settings** dialog:
+
+![SubDuck Settings](docs/settings.png)
+
 ## Tests
 
 ```bash
