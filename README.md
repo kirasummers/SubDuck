@@ -4,7 +4,9 @@ PySide6 desktop tool for scanning video files against custom trigger word lists,
 
 ![SubDuck Interface](docs/screenshot.png)
 
-If a video doesn't have text subtitles (or only has Blu-ray PGS / DVD VobSub bitmap subtitles), SubDuck can extract a temporary 16 kHz mono WAV and transcribe it locally with `faster-whisper`.
+If a video doesn't have text subtitles (or only has Blu-ray PGS / DVD VobSub bitmap subtitles), SubDuck can extract a temporary 16 kHz mono WAV and transcribe it locally with `faster-whisper`. Matched trigger words are cleanly muted or ducked in the audio stream and redacted from the subtitle track:
+
+![SubDuck Subtitle Redaction](docs/subtitles.png)
 
 ## Requirements
 
