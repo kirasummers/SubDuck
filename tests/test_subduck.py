@@ -52,6 +52,16 @@ def test_regex_boundaries():
     loose = build_word_regex("cat", strict=False)
     assert loose.search("scatter across")
 
+    # Compound flexibility (spaces and hyphens interchangeable)
+    compound_space = build_word_regex("panic attack", strict=True)
+    assert compound_space.search("having a panic attack")
+    assert compound_space.search("having a panic-attack")
+    assert compound_space.search("having a panic_attack")
+
+    compound_hyphen = build_word_regex("anti-inflammatory", strict=True)
+    assert compound_hyphen.search("took an anti-inflammatory pill")
+    assert compound_hyphen.search("took an anti inflammatory pill")
+
 
 def test_censor_tokens():
     assert censor_word_token(" needle"[1:], "asterisks") == "******"

@@ -3,10 +3,16 @@ from subduck.models import SubtitleEntry, TriggerMatch, CensorConfig
 
 
 def build_word_regex(word: str, strict: bool = True) -> re.Pattern:
-    escaped = re.escape(word.strip())
+    tokens = [re.escape(t) for t in re.split(r"[-\s_]+", word.strip()) if t]
+    if not tokens:
+        pattern_str = re.escape(word.strip())
+    else:
+        # Allow whitespace, hyphens, or underscores interchangeably between compound words
+        pattern_str = r"[-\s_]+".join(tokens)
+
     if strict:
-        return re.compile(rf"(?i)(?<![A-Za-z0-9]){escaped}(?![A-Za-z0-9])")
-    return re.compile(rf"(?i){escaped}")
+        return re.compile(rf"(?i)(?<![A-Za-z0-9]){pattern_str}(?![A-Za-z0-9])")
+    return re.compile(rf"(?i){pattern_str}")
 
 
 def censor_word_token(word: str, style: str) -> str:
@@ -86,7 +92,7 @@ def calculate_merged_mute_intervals(
     for m in matches:
         word_hits = []
         if m.entry.word_timings:
-            has_phrase = any(" " in mw.strip() for mw in m.matched_words)
+            has_phrase = any(bool(re.search(r"[-\s_]", mw.strip())) for mw in m.matched_words)
             if not has_phrase:
                 pats = [build_word_regex(mw, strict=strict) for mw in m.matched_words]
                 for tok, w_start, w_end in m.entry.word_timings:
