@@ -57,9 +57,12 @@ def probe_video(video_path: Path) -> dict:
         "ffprobe", "-v", "quiet", "-print_format", "json",
         "-show_format", "-show_streams", str(video_path)
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-    if res.returncode == 0 and res.stdout:
-        return json.loads(res.stdout)
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        if res.returncode == 0 and res.stdout:
+            return json.loads(res.stdout)
+    except Exception:
+        pass
     return {}
 
 
@@ -74,19 +77,27 @@ def _format_bitmap_label(codec_name: str) -> str:
     return codec_name.upper()
 
 
-def extract_subtitles_from_video(video_path: Path, preferred_lang: str = "eng"):
+def extract_subtitles_from_video(
+    video_path: Path,
+    preferred_lang: str = "eng",
+    meta: dict | None = None
+):
     stem = video_path.stem
     parent = video_path.parent
 
     for suffix in (".srt", ".en.srt", ".eng.srt", ".English.srt", ".vtt"):
         sidecar = parent / f"{stem}{suffix}"
         if sidecar.is_file():
-            content = sidecar.read_text(encoding="utf-8", errors="replace")
-            entries = parse_srt_content(content)
-            if entries:
-                return entries, f"External ({sidecar.name})", False, ""
+            try:
+                content = sidecar.read_text(encoding="utf-8", errors="replace")
+                entries = parse_srt_content(content)
+                if entries:
+                    return entries, f"External ({sidecar.name})", False, ""
+            except Exception:
+                pass
 
-    meta = probe_video(video_path)
+    if meta is None:
+        meta = probe_video(video_path)
     sub_streams = [s for s in meta.get("streams", []) if s.get("codec_type") == "subtitle"]
     if not sub_streams:
         return [], "None", False, ""
@@ -136,11 +147,19 @@ def extract_subtitles_from_video(video_path: Path, preferred_lang: str = "eng"):
             "-map", f"0:{stream_idx}",
             "-f", "srt", "-"
         ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if res.returncode == 0 and res.stdout.strip():
-            entries = parse_srt_content(res.stdout)
-            if entries:
-                return entries, f"Embedded [Track {stream_idx}: {stream_lang} ({stream_codec})]", has_bitmap, bitmap_codec
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if res.returncode == 0 and res.stdout.strip():
+                entries = parse_srt_content(res.stdout)
+                if entries:
+                    return entries, f"Embedded [Track {stream_idx}: {stream_lang} ({stream_codec})]", has_bitmap, bitmap_codec
+        except subprocess.TimeoutExpired:
+            # Network extraction timed out (common over kio-fuse smb for multi-GB containers)
+            if has_bitmap:
+                return [], f"Embedded [Bitmap: {bitmap_codec}]", True, bitmap_codec
+            return [], f"Embedded [Track {stream_idx}: {stream_lang} ({stream_codec}) - Timeout]", False, ""
+        except Exception:
+            pass
 
     if has_bitmap:
         return [], f"Embedded [Bitmap: {bitmap_codec}]", True, bitmap_codec

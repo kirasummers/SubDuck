@@ -72,47 +72,61 @@ class FolderScanWorker(QThread):
         total = len(video_files)
         results = []
 
-        for i, v_path in enumerate(video_files, 1):
-            if self._is_cancelled:
-                break
+        try:
+            for i, v_path in enumerate(video_files, 1):
+                if self._is_cancelled:
+                    break
 
-            self.progress.emit(i, total, v_path.name)
+                self.progress.emit(i, total, v_path.name)
 
-            file_size = v_path.stat().st_size if v_path.exists() else 0
-            probe_meta = probe_video(v_path)
-            duration = float(probe_meta.get("format", {}).get("duration", 0.0) or 0.0)
+                try:
+                    file_size = v_path.stat().st_size if v_path.exists() else 0
+                    probe_meta = probe_video(v_path)
+                    duration = float(probe_meta.get("format", {}).get("duration", 0.0) or 0.0)
 
-            info = VideoFileInfo(
-                path=v_path,
-                filename=v_path.name,
-                file_size=file_size,
-                duration_sec=duration
-            )
+                    info = VideoFileInfo(
+                        path=v_path,
+                        filename=v_path.name,
+                        file_size=file_size,
+                        duration_sec=duration
+                    )
 
-            sub_entries, sub_desc, has_bitmap, bitmap_codec = extract_subtitles_from_video(
-                v_path, self.config.subtitle_lang
-            )
-            info.subtitle_entries = sub_entries
-            info.subtitle_source = sub_desc
-            info.has_subtitles = len(sub_entries) > 0
-            info.has_bitmap_subtitles = has_bitmap
-            info.bitmap_codec = bitmap_codec
+                    sub_entries, sub_desc, has_bitmap, bitmap_codec = extract_subtitles_from_video(
+                        v_path, self.config.subtitle_lang, meta=probe_meta
+                    )
+                    info.subtitle_entries = sub_entries
+                    info.subtitle_source = sub_desc
+                    info.has_subtitles = len(sub_entries) > 0
+                    info.has_bitmap_subtitles = has_bitmap
+                    info.bitmap_codec = bitmap_codec
 
-            if info.has_subtitles and self.config.trigger_words:
-                matches = scan_subtitles_for_triggers(sub_entries, self.config)
-                info.matches = matches
-                info.status = f"Flagged ({info.trigger_count})" if matches else "Clean"
-            elif info.has_subtitles:
-                info.status = "Clean"
-            elif info.has_bitmap_subtitles:
-                info.status = f"Bitmap ({bitmap_codec})"
-            else:
-                info.status = "No Subtitles"
+                    if info.has_subtitles and self.config.trigger_words:
+                        matches = scan_subtitles_for_triggers(sub_entries, self.config)
+                        info.matches = matches
+                        info.status = f"Flagged ({info.trigger_count})" if matches else "Clean"
+                    elif info.has_subtitles:
+                        info.status = "Clean"
+                    elif info.has_bitmap_subtitles:
+                        info.status = f"Bitmap ({bitmap_codec})"
+                    elif "Timeout" in info.subtitle_source:
+                        info.status = "Extraction Timeout"
+                    else:
+                        info.status = "No Subtitles"
 
-            results.append(info)
-            self.file_found.emit(info)
-
-        self.scan_finished.emit(results)
+                    results.append(info)
+                    self.file_found.emit(info)
+                except Exception as file_err:
+                    fallback_info = VideoFileInfo(
+                        path=v_path,
+                        filename=v_path.name,
+                        file_size=0,
+                        duration_sec=0.0
+                    )
+                    fallback_info.status = f"Scan Error: {file_err}"
+                    results.append(fallback_info)
+                    self.file_found.emit(fallback_info)
+        finally:
+            self.scan_finished.emit(results)
 
 
 class WhisperTranscribeWorker(QThread):
@@ -885,6 +899,9 @@ class MainWindow(QMainWindow):
         elif info.has_bitmap_subtitles:
             sub_item.setText(f"{info.subtitle_source} (Whisper Ready)")
             sub_item.setToolTip("Image bitmap subtitles cannot be parsed as text directly. Use Whisper to transcribe.")
+        elif "Timeout" in info.subtitle_source:
+            sub_item.setText(info.subtitle_source)
+            sub_item.setToolTip("Subtitle extraction timed out over network share. Mount via CIFS or extract sidecar .srt.")
         else:
             sub_item.setText("No Subtitles")
         self.table.setItem(row, 2, sub_item)
@@ -899,6 +916,8 @@ class MainWindow(QMainWindow):
             trig_item.setText("Clean")
         elif info.has_bitmap_subtitles:
             trig_item.setText("Needs Transcription")
+        elif "Timeout" in info.subtitle_source:
+            trig_item.setText("Timeout")
         else:
             trig_item.setText("-")
         self.table.setItem(row, 3, trig_item)

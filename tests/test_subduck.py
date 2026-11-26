@@ -179,3 +179,25 @@ def test_paths_and_copy(tmp_path):
     aborted = tmp_path / "aborted.mkv"
     assert not safe_copy_file(ep, aborted, cancel_check=lambda: True, chunk_size=16)
     assert not aborted.exists()
+
+
+def test_sleep_inhibitor():
+    from subduck.power_manager import SleepInhibitor, _active_inhibitors, _kill_stale_subduck_inhibitors
+
+    inhibitor = SleepInhibitor()
+    assert not inhibitor.is_active
+
+    inhibitor.acquire("Test reason")
+    assert inhibitor.is_active
+    assert inhibitor in _active_inhibitors
+
+    inhibitor.release()
+    assert not inhibitor.is_active
+    assert inhibitor not in _active_inhibitors
+
+    with SleepInhibitor() as inh:
+        assert inh.is_active
+    assert not inh.is_active
+
+    _kill_stale_subduck_inhibitors()
+
