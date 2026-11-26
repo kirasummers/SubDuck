@@ -147,11 +147,25 @@ def extract_subtitles_from_video(
             "-map", f"0:{stream_idx}",
             "-f", "srt", "-"
         ]
+        file_size_mb = 0
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if video_path.exists():
+                file_size_mb = video_path.stat().st_size / (1024 * 1024)
+        except Exception:
+            pass
+        extract_timeout = max(180, int(file_size_mb * 0.5))
+
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=extract_timeout)
             if res.returncode == 0 and res.stdout.strip():
                 entries = parse_srt_content(res.stdout)
                 if entries:
+                    try:
+                        sidecar = parent / f"{stem}.srt"
+                        if not sidecar.exists():
+                            sidecar.write_text(res.stdout, encoding="utf-8")
+                    except Exception:
+                        pass
                     return entries, f"Embedded [Track {stream_idx}: {stream_lang} ({stream_codec})]", has_bitmap, bitmap_codec
         except subprocess.TimeoutExpired:
             # Network extraction timed out (common over kio-fuse smb for multi-GB containers)
